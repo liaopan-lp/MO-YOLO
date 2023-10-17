@@ -3,4 +3,4 @@ MO-YOLO: End-to-End Multiple-Object Tracking Method with YOLO and MOTR
 
 Our code and paper will comming soon.
 
-Thanks for https://github.com/ultralytics/ultralytics/ and https://github.com/megvii-research/MOTR
+Thanks for the contributions from Ultralytics and MOTR by Megvii Research.
