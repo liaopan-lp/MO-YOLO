@@ -5,7 +5,7 @@ In recent times, the field has witnessed the emergence of end-to-end MOT models 
 
 In order to address these challenges more effectively, a retrospective analysis of the origins of the Transformer model becomes imperative. The Transformer architecture was initially proposed for the domain of Natural Language Processing (NLP). As researchers continuously refined this model, the GPT emerged as a prominent highlight in the NLP field over the past few years. GPT, exclusively utilizing the decoder component of the Transformer, achieves pre-training and fine-tuning for various language tasks by stacking multiple decoder layers to construct a deep neural network.
 
-Inspired by the success of GPT, this paper adopts a network structure combining the principles of You Only Look Once (YOLO)\cite{redmon2016you} and RT-DETR\cite{lvDETRsBeatYOLOs2023}, incorporating tracking concepts from MOTR. The resultant model, named MO-YOLO, follows a decoder-based end-to-end MOT approach.
+Inspired by the success of GPT, this paper adopts a network structure combining the principles of You Only Look Once (YOLO) and RT-DETR, incorporating tracking concepts from MOTR. The resultant model, named MO-YOLO, follows a decoder-based end-to-end MOT approach.
 
 Our code and paper will comming soon.
 
