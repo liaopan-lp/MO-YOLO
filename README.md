@@ -1,6 +1,6 @@
 # MO-YOLO: End-to-End Multiple-Object Tracking Method with YOLO and Decoder
 Official implementation of ['MO-YOLO: End-to-End Multiple-Object Tracking Method with YOLO and Decoder'](https://arxiv.org/abs/2310.17170) .
-Code will coming soon!
+Code will coming soon! 作者被拉去做横向了😵‍💫(The writer has to do some fuxxing things.)
 # Introduction
 In recent times, the field has witnessed the emergence of end-to-end MOT models based on Transformer architectures, boasting superior performance on datasets such as DanceTracker compared to tracking-by-detection methods. However, the computational demands associated with Transformer models present challenges in terms of both training and deployment, necessitating formidable hardware resources.
 
