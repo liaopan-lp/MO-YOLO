@@ -2,7 +2,8 @@
 Official implementation of ['DecoderTracker: Decoder-Only Method for Multiple-Object Tracking'](https://arxiv.org/abs/2310.17170) .
 
 
-
+# Notice to Users
+Thank you for your interest in the DecoderTracker implementation. We want to inform you that the current code release includes known issues that we are actively working to resolve. This notice outlines the identified problems and our plan to address them in the near future.
 
 # Introduction
 In recent times, the field has witnessed the emergence of end-to-end MOT models based on Transformer architectures, boasting superior performance on datasets such as DanceTracker compared to tracking-by-detection methods. However, the computational demands associated with Transformer models present challenges in terms of both training and deployment, necessitating formidable hardware resources.
