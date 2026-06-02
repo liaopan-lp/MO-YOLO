@@ -7,7 +7,7 @@ from typing import Union
 from ultralytics.cfg import get_cfg
 from ultralytics.engine.exporter import Exporter
 from ultralytics.models import yolo  # noqa
-from ultralytics.models import MOTRtrack
+from ultralytics.models.DecoderTracker import TrackTrainer, TrackValidator, TrackPredictor
 from ultralytics.nn.tasks import (ClassificationModel, DetectionModel, TrackingModel, PoseModel, SegmentationModel,
                                   attempt_load_one_weight, guess_model_task, nn, yaml_model_load)
 from ultralytics.utils import (DEFAULT_CFG, DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, RANK, ROOT, callbacks,
@@ -27,7 +27,7 @@ TASK_MAP = {
         SegmentationModel, yolo.segment.SegmentationTrainer, yolo.segment.SegmentationValidator,
         yolo.segment.SegmentationPredictor],
     'pose': [PoseModel, yolo.pose.PoseTrainer, yolo.pose.PoseValidator, yolo.pose.PosePredictor],
-    'track': [TrackingModel, MOTRtrack.TrackTrainer, MOTRtrack.TrackValidator, MOTRtrack.TrackPredictor]}
+    'track': [TrackingModel, TrackTrainer, TrackValidator, TrackPredictor]}
 
 
 class YOLO:

@@ -301,42 +301,30 @@ class QueryInteractionModule(QueryInteractionBase):
         return track_instances
 
     def forward(self, data) -> Instances:
-        # try:
-        #     active_track_instances = self._select_active_tracks(data)
-        #     # 注意下啊，我这应该是用不到才对
-        #     active_track_instances = self._update_track_embedding(active_track_instances)
-        #     init_track_instances: Instances = data['init_track_instances']\
-
-        #     # print(active_track_instances.get_fields())
-        #     merged_track_instances = Instances.cat([active_track_instances, init_track_instances])
-        # except:
-        #     merged_track_instances = data['init_track_instances']
-        detect_queries = data['detect_queries']
+        """
+        Query Interaction Module (TAN) forward pass.
+        
+        FSQM lifecycle management (initiation/termination) is handled externally in DecoderTracker.
+        This module only updates track embeddings (query_pos, ref_pts) for the fixed-size pool.
+        
+        For inactive queries (ID=-1), zero inputs are preserved through all layers
+        (linear, norm, dropout, GELU, self-attention with zero Q/K/V all produce zero output).
+        After update, inactive queries are explicitly re-zeroed for safety.
+        """
         track_queries = data['track_queries']
-
-        # 使用FSQM进行查询内存管理
-        updated_queries = self.fsqm.online_update(detect_queries, track_queries)
-
-        # if self.training:
-        #     active_track_instances = self._select_active_tracks(data)
-        # else:
-        #     active_track_instances = data['track_instances']
-        # init_track_instances: Instances = data['init_track_instances']
-        # # print(active_track_instances)
-        # if updated_queries is not None:
-        #     active_track_instances = self._update_track_embedding(updated_queries)
-        #     # print(active_track_instances.get_fields())
-        #     # init_track_instances.query_pos = init_track_instances.query_pos.unsqueeze(0)
-        #     merged_track_instances = Instances.cat([active_track_instances, init_track_instances])
-        #     # try:
-        #     #     merged_track_instances = Instances.cat([active_track_instances, init_track_instances])
-        #     # except:
-        #     #     # print(active_track_instances)
-        #     #     merged_track_instances = init_track_instances
-        # else:
-        #     merged_track_instances = init_track_instances
-        # # merged_track_instances = active_track_instances
-        # merged_track_instances.query_pos = merged_track_instances.query_pos
+        
+        # Update track embeddings for the full fixed-size pool
+        updated_queries = self._update_track_embedding(track_queries)
+        
+        # Re-zero inactive queries to ensure they remain zero after QIM processing
+        # This handles edge cases where floating point operations might introduce small values
+        inactive_mask = (updated_queries.obj_idxes.view(-1) == -1)
+        if inactive_mask.any():
+            d = updated_queries.query_pos.shape[1]
+            updated_queries.query_pos[inactive_mask] = 0.0
+            updated_queries.ref_pts[inactive_mask] = 0.0
+            updated_queries.output_embedding[inactive_mask] = 0.0
+        
         return updated_queries
 
 

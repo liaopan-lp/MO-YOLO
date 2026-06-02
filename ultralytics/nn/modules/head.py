@@ -21,7 +21,7 @@ from MOTR.models.structures import Instances, Boxes, pairwise_iou, matched_boxli
 
 # from MOTR.models.deformable_transformer_plus import *
 
-__all__ = 'Detect', 'Segment', 'Pose', 'Classify', 'RTDETRDecoder', 'MOTRTrack'
+__all__ = 'Detect', 'Segment', 'Pose', 'Classify', 'RTDETRDecoder', 'DecoderTracker', 'MOTRTrack'
 
 
 class Detect(nn.Module):
@@ -79,7 +79,7 @@ class Detect(nn.Module):
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
-        m = self  # self.model[-1]  # Detect() module
+        m = self  # self.model[-1]  # Detect() class
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
@@ -87,15 +87,23 @@ class Detect(nn.Module):
             b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
 
-class MOTRTrack(nn.Module):
-    """YOLOv8 Track head for detection models."""
+class DecoderTracker(nn.Module):
+    """
+    DecoderTracker head with Fixed-Size Query Memory (FSQM).
+    
+    Implements:
+    - Fixed-size track query memory pool (N_m queries)
+    - Track initiation from high-confidence detections
+    - Track termination after 3 consecutive low-confidence frames
+    - Self-attention masking for inactive queries
+    """
     dynamic = False  # force grid reconstruction
     export = False  # export mode
     shape = None
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
 
-    def __init__(self, nc=80, ch=(), d_model=256, aux_loss=False, nq=300):  # detection layer
+    def __init__(self, nc=80, ch=(), use_fsqm=True, d_model=256, aux_loss=False, nq=300, training_stage=3):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
@@ -103,7 +111,10 @@ class MOTRTrack(nn.Module):
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         self.aux_loss = aux_loss
+        self.use_fsqm = use_fsqm  # whether to use Fixed-Size Query Memory
         self.is_first = True
+        self.training_stage = training_stage  # 1=detection, 2=TBSP, 3=TALA
+        self.tbsp_iou_threshold = 0.5  # IOU threshold for TBSP filtering
         from MOTR.models.qim import build as build_query_interaction_layer
         from MOTR.main import get_args_parser
         import argparse
@@ -123,29 +134,21 @@ class MOTRTrack(nn.Module):
             self.matcher = HungarianMatcherGroup()  #
         else:
             self.matcher = None
-        # parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[
-        # motr_args_parser()]) args = parser.parse_args() transfomers=build_deforamble_transformer(args)
 
-        # decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward, dropout, activation,
-        # num_feature_levels, nhead, dec_n_points, decoder_self_cross, sigmoid_attn=sigmoid_attn,
-        # extra_track_attn=extra_track_attn)
         if torch.cuda.is_available():
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
 
-        # self.query_embed = nn.Embedding(self.decoder.num_queries, self.decoder.hidden_dim * 2, device=device)
-        # self.query_embed = nn.Embedding(self.decoder.num_queries, self.decoder.hidden_dim)
-
-        # 这个是跟踪信息
+        # Track instances storage
         self.track_instances = None
         self.track_instances_pre = None
-
-        # if self.track_instances is None:
-        #     self.track_instances = self._generate_empty_tracks()
-
-        # 没啥用,之后可能有用，先none
         self.memory_bank = None
+
+        # FSQM parameters (Fixed-Size Query Memory)
+        self.tau_in = 0.5   # threshold for track initiation
+        self.tau_out = 0.3  # threshold for track termination
+        self.max_obj_id = 0 # global ID counter
 
     def _generate_empty_tracks(self, len_before=0):
         from MOTR.models.structures import Instances
@@ -155,70 +158,138 @@ class MOTRTrack(nn.Module):
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
-        # device = self.query_embed.weight.device
-        # self.decoder.reference_points.to(device)
 
-        # track_instances.ref_pts = self.decoder.reference_points(self.query_embed.weight[:, :dim // 2])
-        track_instances.ref_pts = torch.rand(num_queries, 4, device=device).to(device)
-
-        # self.query_embed.weight.to(device)
-        # track_instances.query_pos = self.query_embed.weight
+        # Fixed-size memory pool: N_m queries, all initialized to zero
+        track_instances.ref_pts = torch.zeros(num_queries, 4, device=device)
         track_instances.query_pos = torch.zeros((num_queries, 256), dtype=torch.float, device=device)
-
         track_instances.output_embedding = torch.zeros((num_queries, dim >> 1), device=device)
-
-        # track_instances.obj_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device) #这个可能是id？
-        track_instances.obj_idxes = torch.full((len(track_instances), 1), -1, dtype=torch.long,
-                                               device=device)  # ID
+        
+        # Global ID pool: all inactive (-1)
+        track_instances.obj_idxes = torch.full((len(track_instances), 1), -1, dtype=torch.long, device=device)
         track_instances.matched_gt_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)
         track_instances.disappear_time = torch.zeros((len(track_instances), 1), dtype=torch.long, device=device)
         track_instances.iou = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.track_scores = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
         track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_logits = torch.zeros((len(track_instances), self.nc), dtype=torch.float,
-                                                  device=device)
+        track_instances.pred_logits = torch.zeros((len(track_instances), self.nc), dtype=torch.float, device=device)
 
-        # mem_bank_len = self.mem_bank_len
-        # track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, dim // 2), dtype=torch.float32,
-        #                                        device=device)
-        # track_instances.mem_padding_mask = torch.ones((len(track_instances), mem_bank_len), dtype=torch.bool,
-        #                                               device=device)
-        # track_instances.save_period = torch.zeros((len(track_instances),), dtype=torch.float32, device=device)
+        # FSQM: consecutive low-confidence frame counter
+        track_instances.low_conf_count = torch.zeros((len(track_instances),), dtype=torch.long, device=device)
 
         return track_instances.to(device)
 
+    def _generate_attn_mask(self):
+        """
+        Generate self-attention mask for FSQM.
+        
+        Mask size: (N_m + N) x (N_m + N) where N_m = track queries, N = detect queries.
+        Uses vectorized operations for efficiency.
+        Detect queries always have ID=0 (active).
+        
+        Mask_{ij} = -inf if ID_ext[i] == -1 OR ID_ext[j] == -1, else 0.
+        """
+        if self.track_instances is None:
+            return None
+
+        nm = self.nq  # N_m (track queries)
+        nq = self.nq  # N (detect queries)
+        device = self.track_instances.obj_idxes.device
+
+        # Get track query IDs (first N_m entries only, even if track_instances was expanded)
+        track_ids = self.track_instances.obj_idxes[:nm].view(-1)  # (N_m,)
+
+        # Extend ID: track IDs + detect IDs (always active, ID=0)
+        id_ext = torch.cat([track_ids, torch.zeros(nq, dtype=torch.long, device=device)], dim=0)
+
+        # Generate mask using vectorized operations (much faster than nested loops)
+        inactive_i = (id_ext == -1).unsqueeze(1).float()  # (N_m+N, 1)
+        inactive_j = (id_ext == -1).unsqueeze(0).float()  # (1, N_m+N)
+        inactive_mask = (inactive_i + inactive_j) > 0  # (N_m+N, N_m+N)
+
+        # Use large negative number to avoid NaN in softmax
+        mask = torch.where(inactive_mask,
+                           torch.tensor(-1e4, device=device, dtype=torch.float32),
+                           torch.tensor(0.0, device=device, dtype=torch.float32))
+
+        if (id_ext == -1).any():
+            return mask
+        return None
+
+    def _tbsp_filter(self, track_pred_boxes, track_pred_logits, det_pred_boxes, det_pred_logits):
+        """
+        TBSP: Tracking Box Selection Process.
+        Filter detect queries that overlap with track queries by IOU threshold.
+        
+        For stage 2 training: detect queries with IOU > threshold against any track query are discarded.
+        This prevents detect queries from being assigned to already-tracked objects.
+        
+        Args:
+            track_pred_boxes: (N_m, 4) - predicted boxes from track queries (active ones)
+            track_pred_logits: (N_m, nc) - predicted logits from track queries
+            det_pred_boxes: (N_m, 4) - predicted boxes from detect queries
+            det_pred_logits: (N_m, nc) - predicted logits from detect queries
+            
+        Returns:
+            filtered_det_boxes, filtered_det_logits, keep_mask
+        """
+        # Find active track queries (obj_idxes >= 0)
+        active_mask = self.track_instances.obj_idxes.view(-1) >= 0
+        if not active_mask.any():
+            # No active tracks, all detect queries pass through
+            keep_mask = torch.ones(det_pred_boxes.shape[0], dtype=torch.bool, device=det_pred_boxes.device)
+            return det_pred_boxes, det_pred_logits, keep_mask
+        
+        active_track_boxes = track_pred_boxes[active_mask]  # (n_active, 4)
+        
+        # Compute IOU between each detect query and all active track queries
+        # det_pred_boxes: (N_det, 4), active_track_boxes: (N_track, 4)
+        # Use pairwise_iou from structures
+        det_boxes_xyxy = Boxes(det_pred_boxes)
+        track_boxes_xyxy = Boxes(active_track_boxes)
+        
+        try:
+            ious = pairwise_iou(det_boxes_xyxy, track_boxes_xyxy)  # (N_det, N_active)
+            # Keep detect queries where max IOU with any track query <= threshold
+            max_iou_per_det, _ = ious.max(dim=1)  # (N_det,)
+            keep_mask = max_iou_per_det <= self.tbsp_iou_threshold
+        except:
+            keep_mask = torch.ones(det_pred_boxes.shape[0], dtype=torch.bool, device=det_pred_boxes.device)
+        
+        return det_pred_boxes, det_pred_logits, keep_mask
+
     def forward(self, x, batch=None, is_first=True):
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        """Forward pass with FSQM: fixed-size query memory with attention masking."""
 
         shape = x[0].shape  # BCHW
-        # transformer_decoder = self.decoder  # 替换为你的 Transformer Decoder 类
-        # for i in range(self.nl):
-        #     x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        
+        # Stage 1 (detection): always treat as first frame (no tracking)
+        if self.training and self.training_stage == 1:
+            self.is_first = True
+        else:
+            self.is_first = is_first
 
         if self.is_first or self.track_instances is None:
+            # Initialize fixed-size track memory (all zeros, all IDs=-1)
             self.track_instances = self._generate_empty_tracks()
             self.track_base = RuntimeTrackerBase(training=self.training)
             self.track_base.clear()
             ref_pts = None
             pre_class = None
             track_query_pos = None
+            # No masking needed for first frame (all tracks inactive)
+            attn_mask = None
         else:
-            # if self.training:
-            #     tmp = {'init_track_instances': self._generate_empty_tracks(),
-            #            'track_instances': self.track_instances}
-            #
-            #     self.track_instances = self.track_embed(tmp)
-
-            # active_track_instances = self.track_instances[:len(self.track_instances) - self.nq]
-            active_track_instances = self.track_instances
-            ref_pts = active_track_instances.ref_pts
-            pre_class = active_track_instances.pred_logits
-            track_query_pos = active_track_instances.query_pos
-            if len(active_track_instances) <= 0:
+            # Use stored track queries (fixed-size pool)
+            ref_pts = self.track_instances.ref_pts
+            pre_class = self.track_instances.pred_logits
+            track_query_pos = self.track_instances.query_pos
+            if len(self.track_instances) <= 0:
                 ref_pts = None
                 pre_class = None
                 track_query_pos = None
+            # Generate attention mask based on track IDs (only when FSQM is enabled)
+            attn_mask = self._generate_attn_mask() if self.use_fsqm else None
 
         [dec_bboxes, dec_scores, enc_bbox, enc_outputs_class, dn_meta, init_reference,
          dec_output_embeding] = self.decoder(x,
@@ -226,10 +297,12 @@ class MOTRTrack(nn.Module):
                                              track_ref_pts=ref_pts,
                                              batch=batch,
                                              is_first=self.is_first,
-                                             pre_class=pre_class)
+                                             pre_class=pre_class,
+                                             attn_mask=attn_mask)
 
         x = dec_bboxes, dec_scores, enc_bbox, enc_outputs_class, dn_meta, init_reference, dec_output_embeding
         match_indices = self._update_track_instances(x, is_first=self.is_first, batch=batch)
+
         if self.training:
             return x, self.track_instances, self.nq, match_indices
         y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
@@ -239,22 +312,25 @@ class MOTRTrack(nn.Module):
             return (y, x), self.track_instances
 
     def _update_track_instances(self, out, is_first=False, batch=None):
-
+        """
+        Update track instances with decoder outputs and manage track lifecycle via FSQM.
+        
+        Decoder input is [DN (if any), track_queries (N_m), detect_queries (N_m)].
+        Decoder output is [DN (if any), track_queries (N_m), detect_queries (N_m)].
+        
+        We only update track_instances (N_m entries) with the track query portion (first N_m).
+        For matching, we use all 2*N_m outputs.
+        After QIM update, track_instances remains N_m entries.
+        """
         dec_bboxes, dec_scores, enc_bbox, enc_outputs_class, enc_outputs_coord_unact, init_reference, dec_output_embeding = out
+
+        # Split DN and detection outputs if DN metadata exists
         if enc_outputs_coord_unact is not None:
             dn_bboxes, dec_bboxes = torch.split(dec_bboxes, enc_outputs_coord_unact['dn_num_split'], dim=2)
             _, init_reference = torch.split(init_reference, enc_outputs_coord_unact['dn_num_split'], dim=1)
             dn_scores, dec_scores = torch.split(dec_scores, enc_outputs_coord_unact['dn_num_split'], dim=2)
-        else:
-            dec_bboxes = dec_bboxes
-            init_reference = init_reference
-            dec_scores = dec_scores
 
-        # dec_scores
-        # torch.Size([6, 1, 288, 5]) KITTI
-        # torch.Size([6, 1, 91, 1]) MOT
-
-        outputs_classes = []
+        # Compute reference points across all decoder layers
         outputs_coords = []
         for lvl in range(dec_bboxes.shape[0]):
             if lvl == 0:
@@ -263,164 +339,96 @@ class MOTRTrack(nn.Module):
                 reference = dec_bboxes[lvl - 1]
             from MOTR.util.misc import inverse_sigmoid
             reference = inverse_sigmoid(reference)
-            # outputs_class = self.class_embed[lvl](hs[lvl])
-            tmp = dec_bboxes[lvl]
-
-            # if reference.shape[-1] == 4:
-            #     tmp = tmp + reference
-            # else:
-            #     assert reference.shape[-1] == 2
-            #     new_tmp = tmp[..., :2] + reference
-            #     tmp[..., :2] = new_tmp
-
-            outputs_coord = tmp
-            # outputs_classes.append(outputs_class)
+            outputs_coord = dec_bboxes[lvl]
             outputs_coords.append(outputs_coord)
-        outputs_class = dec_scores
         outputs_coord = torch.stack(outputs_coords)
-        #        [[[0.6640, 0.5385, 0.5343, 0.5781],
 
         if not self.training:
             init_reference = init_reference.clone().to(dec_bboxes.device)
 
-        ref_pts_all = torch.cat([init_reference[None], dec_bboxes[:, :, :, :4]], dim=0).to(outputs_class.device)
+        ref_pts_all = torch.cat([init_reference[None], dec_bboxes[:, :, :, :4]], dim=0).to(dec_scores.device)
 
-        # outputs_class[-1]
-        # torch.Size([1, 114, 1]) MOT17
-        # torch.Size([1, 101, 5]) KITTI
+        # Extract final layer outputs (all 2*N_m entries: track + detect)
+        outputs_class = dec_scores
+        all_pred_logits = outputs_class[-1]   # (bs, 2*N_m, nc)
+        all_pred_boxes = outputs_coord[-1]    # (bs, 2*N_m, 4)
+        all_ref_pts = ref_pts_all[-1]         # (bs, 2*N_m, 4)
+        all_hs = dec_output_embeding[-1]      # (bs, 2*N_m, d)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'ref_pts': ref_pts_all[-1],
-               'hs': dec_output_embeding[-1]}
-        frame_res, indices, unmatched_track_idxes = self._post_process_single_image(out, self.track_instances,
-                                                                                    batch=batch)
+        # Split into track queries (first N_m) and detect queries (last N_m)
+        nm = self.nq
+        track_pred_logits = all_pred_logits[:, :nm, :]    # (bs, N_m, nc)
+        track_pred_boxes = all_pred_boxes[:, :nm, :]      # (bs, N_m, 4)
+        track_hs = all_hs[:, :nm, :]                       # (bs, N_m, d)
+        track_scores = track_pred_logits[0, :].sigmoid().max(dim=-1).values.detach()
 
-        self.track_instances = frame_res['track_instances']
-        return [indices, unmatched_track_idxes]
+        # Update track_instances with track query outputs only (N_m entries)
+        self.track_instances.scores = track_scores
+        self.track_instances.pred_logits = track_pred_logits[0]  # (N_m, nc)
+        self.track_instances.pred_boxes = track_pred_boxes[0]    # (N_m, 4)
+        self.track_instances.output_embedding = track_hs[0]      # (N_m, d)
 
-    def _post_process_single_image(self, frame_res, track_instances, batch=None):
-        indices = None
-        with torch.no_grad():
-            # torch.Size([60, 5]) KITTI
-            # torch.Size([116, 1]) MOT
-            if self.training:
-                # print('训练时：', frame_res['pred_logits'].shape)
-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
-            else:
-                # print('推理时：', frame_res['pred_logits'].shape)
-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
+        # Lifecycle management: FSQM or default tracker
+        if self.use_fsqm:
+            self._fsqm_lifecycle_update()
+        else:
+            self.track_base.update(self.track_instances)
 
-        # 这个可以先不用管
-        track_instances.scores = track_scores
-
-        track_instances.pred_logits = frame_res['pred_logits'][0]
-
-        track_instances.pred_boxes = frame_res['pred_boxes'][0]
-        # 我不要它的loss（因为不太好改），我这里只要id
-        track_instances.output_embedding = frame_res['hs']
+        # Match with GT (training) or assign IDs (inference)
         matched_indices = None
         unmatched_track_idxes = None
-        if self.memory_bank is not None:
-            track_instances = self.memory_bank(track_instances)
-        if batch is not None and track_instances is not None:
-            indices = None
-            frame_res['track_instances'] = track_instances
+        if batch is not None:
+            pred_logits_i = self.track_instances.pred_logits  # (N_m, nc)
+            pred_boxes_i = self.track_instances.pred_boxes    # (N_m, 4)
+            self.track_instances.matched_gt_idxes[...] = -1
 
-            pred_logits_i = track_instances.pred_logits  # predicted logits of i-th image.
-            pred_boxes_i = track_instances.pred_boxes  # predicted boxes of i-th image.
-            track_instances.matched_gt_idxes[...] = -1
             if len(batch['track_id']) == 0:
-                # tmp = {'init_track_instances': self._generate_empty_tracks(),
-                #        'track_instances': track_instances}
+                return [None, None]
 
-                # out_track_instances = self.track_embed(tmp)
-                frame_res['track_instances'] = track_instances
-                return frame_res, None, None
-
-            if not (track_instances.obj_idxes != -1).any():  # 没有跟踪
-                indices = self.matcher(frame_res["pred_boxes"], frame_res["pred_logits"], batch['bboxes'], batch['cls'],
-                                       batch['gt_groups'])
-
+            if is_first or not (self.track_instances.obj_idxes != -1).any():
+                # First frame or no active tracks: match all with GT
+                indices = self.matcher(track_pred_boxes.unsqueeze(0), track_pred_logits.unsqueeze(0),
+                                       batch['bboxes'], batch['cls'], batch['gt_groups'])
                 indices = [(ind[0].to(pred_logits_i.device), ind[1].to(pred_logits_i.device)) for ind in indices]
 
                 for i, ind in enumerate(indices):
-                    track_instances.matched_gt_idxes[ind[0]] = ind[1]
+                    self.track_instances.matched_gt_idxes[ind[0]] = ind[1]
+                    self.track_instances.obj_idxes[ind[0]] = batch['track_id'][ind[1]].long()
 
-                    track_instances.obj_idxes[ind[0]] = batch['track_id'][ind[1]].long()
-                    active_idxes = torch.logical_and(track_instances.obj_idxes[:, 0] >= 0,
-                                                     track_instances.matched_gt_idxes >= 0)
-                    active_track_instances = track_instances[active_idxes]
-                    active_track_boxes = active_track_instances.pred_boxes
-                    active_idxes = track_instances.matched_gt_idxes >= 0
-
-                    if len(active_track_boxes) > 0:
-                        gt_boxes = batch['bboxes'][
-                            track_instances.matched_gt_idxes[track_instances.matched_gt_idxes >= 0]]
-
-                        # track_instances.iou[active_idxes] = matched_boxlist_iou(Boxes(active_track_boxes),
-                        #                                                         Boxes(gt_boxes))
-                        gt_bboxes = batch['bboxes']
-                        true_indices = torch.nonzero(active_idxes, as_tuple=False)
-                        for i in true_indices:
-                            active_track_box = track_instances.pred_boxes[i]
-                            # 转换为xyxy类型
-                            active_track_box_xyxy = ops.xywh2xyxy(active_track_box)
-                            gt_bboxes_xyxy = ops.xywh2xyxy(gt_bboxes)
-                            # 计算交集和并集
-                            try:
-                                intersection = torch.min(active_track_box_xyxy, gt_bboxes_xyxy)
-                            except:
-                                intersection = 0
-
-                            # 找到最大的 IoU
-                            union = torch.max(active_track_box_xyxy, gt_bboxes_xyxy)
-                            # 计算 IoU
-                            iou = intersection.sum(dim=1) / union.sum(dim=1)
-                            max_iou = iou.max()
-                            track_instances.iou[i] = max_iou
-                            # try:
-                            #     union = torch.max(active_track_box_xyxy, gt_bboxes_xyxy)
-                            #     # 计算 IoU
-                            #     iou = intersection.sum(dim=1) / union.sum(dim=1)
-                            #     max_iou = iou.max()
-                            #     track_instances.iou[i] = max_iou
-                            # except:
-                            #     track_instances.iou[i] = 0
-                        else:
-                            active_track_boxes = None
+                # Update IoU for matched tracks
+                active_idxes = torch.logical_and(
+                    self.track_instances.obj_idxes[:, 0] >= 0,
+                    self.track_instances.matched_gt_idxes >= 0
+                )
+                matched_indices = indices
             else:
-                active_idxes = (track_instances.obj_idxes >= 0).squeeze()
+                # Subsequent frames: match active tracks by ID, match remaining with GT
+                active_idxes = (self.track_instances.obj_idxes >= 0).squeeze()
                 gt_bboxes = batch['bboxes']
                 gt_obj_idxes = batch['track_id']
-                # 将两个张量展平，以便进行比较
-                track_indices_flat = track_instances.obj_idxes.view(-1)
+
+                # Match by track ID
+                track_indices_flat = self.track_instances.obj_idxes.view(-1)
                 gt_indices_flat = gt_obj_idxes.view(-1)
-
-                # 找到两个张量中相同元素的索引
                 matching_indices = torch.nonzero(track_indices_flat[:, None] == gt_indices_flat)
-                # 如果需要分别得到索引，可以使用以下代码
                 i, j = matching_indices[:, 0], matching_indices[:, 1]
-                track_instances.matched_gt_idxes[i] = j
+                self.track_instances.matched_gt_idxes[i] = j
 
-                full_track_idxes = torch.arange(len(track_instances.pred_logits)/2, dtype=torch.long,
-                                                device=pred_logits_i.device)
-
-                matched_track_idxes = (track_indices_flat >= 0)  # occu >=0表明该query为跟踪query
+                # Split matched and unmatched tracks
+                full_track_idxes = torch.arange(nm, dtype=torch.long, device=pred_logits_i.device)
+                matched_track_idxes = (track_indices_flat >= 0)
                 prev_matched_indices = torch.stack(
-                    [full_track_idxes[matched_track_idxes], track_instances.matched_gt_idxes[matched_track_idxes]],
-                    dim=1)  # 检测或跟踪与gt的对应关系
+                    [full_track_idxes[matched_track_idxes],
+                     self.track_instances.matched_gt_idxes[matched_track_idxes]], dim=1)
 
-                # step2. select the unmatched slots.
-                # note that the FP tracks whose obj_idxes are -2 will not be selected here.
-                unmatched_track_idxes = full_track_idxes[track_indices_flat == -1]  # 获取检测query
+                # Unmatched tracks (detection queries) - these are the inactive slots
+                unmatched_track_idxes = full_track_idxes[track_indices_flat == -1]
 
-
-                # step3. select the untracked gt instances (new tracks).
-                tgt_indexes = track_instances.matched_gt_idxes
-                tgt_indexes = tgt_indexes[tgt_indexes != -1]  # 获取跟踪query匹配GT，非新生儿（除了这些之外便是新生儿）
-
+                # Unmatched GT (new objects)
+                tgt_indexes = self.track_instances.matched_gt_idxes
+                tgt_indexes = tgt_indexes[tgt_indexes != -1]
                 tgt_state = torch.zeros(len(gt_indices_flat), device=pred_logits_i.device)
                 tgt_state[tgt_indexes] = 1
-
                 full_tgt_idxes = torch.arange(len(gt_indices_flat), device=pred_logits_i.device)
                 untracked_tgt_indexes = full_tgt_idxes[tgt_state == 0]
 
@@ -428,84 +436,133 @@ class MOTRTrack(nn.Module):
                     'pred_logits': batch['cls'][untracked_tgt_indexes],
                     'pred_boxes': batch['bboxes'][untracked_tgt_indexes],
                     'track_id': batch['track_id'][untracked_tgt_indexes],
-
                 }
 
-                # step4. do matching between the unmatched slots and GTs.该过程就是DET匈牙利匹配过程
+                # TBSP filtering for stage 2: filter detect queries that overlap with active tracks
+                if self.training and self.training_stage == 2:
+                    _, _, tbsp_keep_mask = self._tbsp_filter(
+                        track_pred_boxes=pred_boxes_i,
+                        track_pred_logits=pred_logits_i,
+                        det_pred_boxes=self.track_instances.pred_boxes[unmatched_track_idxes],
+                        det_pred_logits=self.track_instances.pred_logits[unmatched_track_idxes]
+                    )
+                    # Only keep detect queries that passed TBSP filtering
+                    unmatched_track_idxes = unmatched_track_idxes[tbsp_keep_mask]
 
-                unmatched_outputs = {
-                    'pred_logits': track_instances.pred_logits[unmatched_track_idxes].unsqueeze(0),
-                    'pred_boxes': track_instances.pred_boxes[unmatched_track_idxes].unsqueeze(0),
-                }
+                # Match unmatched detections with unmatched GT
+                if len(unmatched_track_idxes) > 0 and len(untracked_tgt_indexes) > 0:
+                    unmatched_outputs = {
+                        'pred_logits': self.track_instances.pred_logits[unmatched_track_idxes].unsqueeze(0),
+                        'pred_boxes': self.track_instances.pred_boxes[unmatched_track_idxes].unsqueeze(0),
+                    }
 
-                new_track_indices = self.matcher(unmatched_outputs["pred_boxes"], unmatched_outputs["pred_logits"],
-                                                 unmatched_tgt['pred_boxes'], unmatched_tgt['pred_logits'],
-                                                 [len(untracked_tgt_indexes)])
+                    new_track_indices = self.matcher(unmatched_outputs["pred_boxes"], unmatched_outputs["pred_logits"],
+                                                      unmatched_tgt['pred_boxes'], unmatched_tgt['pred_logits'],
+                                                      [len(untracked_tgt_indexes)])
 
-                # indices = self.matcher(frame_res["pred_boxes"], frame_res["pred_logits"], batch['bboxes'], batch['cls'],
-                #                        batch['gt_groups'])
+                    src_idx = new_track_indices[0][0]
+                    tgt_idx = new_track_indices[0][1]
+                    new_matched_indices = torch.stack(
+                        [unmatched_track_idxes[src_idx], untracked_tgt_indexes[tgt_idx]], dim=1).to(pred_logits_i.device)
+                else:
+                    new_matched_indices = torch.zeros((0, 2), dtype=torch.long, device=pred_logits_i.device)
 
-                src_idx = new_track_indices[0][0]
-                tgt_idx = new_track_indices[0][1]
-                # concat src and tgt.
-                new_matched_indices = torch.stack([unmatched_track_idxes[src_idx], untracked_tgt_indexes[tgt_idx]],
-                                                  dim=1).to(pred_logits_i.device)
-                # step5. update obj_idxes according to the new matching result. 分配GT的ID给track和GT所在的索引
-                track_instances.obj_idxes[new_matched_indices[:, 0]] = batch['track_id'][
+                # Assign IDs to newly matched detections
+                self.track_instances.obj_idxes[new_matched_indices[:, 0]] = batch['track_id'][
                     new_matched_indices[:, 1]].long()
 
-                # 调整 new_matched_indices 的大小，使其匹配 prev_matched_indices,主要是RT-DETR的loss的匹配顺序和好像MOTR的不一样
-
-                # new_matched_indices_adjusted = new_matched_indices.expand_as(prev_matched_indices)
-
+                # Combine matched indices
                 matched_indices_ = torch.cat([new_matched_indices, prev_matched_indices], dim=0)
                 matched_indices = [(matched_indices_[:, 0], matched_indices_[:, 1])]
-                track_instances.matched_gt_idxes[new_matched_indices[:, 0]] = new_matched_indices[:, 1]
-                # 获取True值的索引
-                true_indices = torch.nonzero(active_idxes, as_tuple=False)
-                if len(true_indices) > 0:
-                    for i in true_indices:
-                        active_track_box = track_instances.pred_boxes[i]
-                        # 计算交集和并集
-                        try:
-                            intersection = torch.min(active_track_box, gt_bboxes)
-                        except:
-                            intersection = 0
+                self.track_instances.matched_gt_idxes[new_matched_indices[:, 0]] = new_matched_indices[:, 1]
 
-                            # 找到最大的 IoU
-                            union = torch.max(active_track_box, gt_bboxes)
-                            # 计算 IoU
-                            iou = intersection.sum(dim=1) / union.sum(dim=1)
-                            max_iou = iou.max()
-                            track_instances.iou[i] = max_iou
-                        # try:
-                        #     union = torch.max(active_track_box, gt_bboxes)
-                        #     # 计算 IoU
-                        #     iou = intersection.sum(dim=1) / union.sum(dim=1)
-                        #     max_iou = iou.max()
-                        #     track_instances.iou[i] = max_iou
-                        # except:
-                        #     pass
-
-                else:
-                    active_track_boxes = None
-        # if not self.training:
-        track_instances = self.track_base.update(track_instances)
-        tmp = {'detect_queries': track_instances,
-               'track_queries': self.track_instances}
+        # Update track embeddings via QIM (TAN)
+        # track_instances has exactly N_m entries; QIM updates query_pos and ref_pts
+        tmp = {'detect_queries': self.track_instances, 'track_queries': self.track_instances}
         out_track_instances = self.track_embed(tmp)
-        frame_res['track_instances'] = out_track_instances
-        # else:
-        #     frame_res['track_instances'] = track_instances
+
+        # Update track instances with QIM outputs (N_m entries preserved)
+        self.track_instances.ref_pts = out_track_instances.ref_pts
+        self.track_instances.query_pos = out_track_instances.query_pos
 
         if self.training:
-            return frame_res, matched_indices, unmatched_track_idxes
+            return [matched_indices, unmatched_track_idxes]
+        return [None, None]
 
-        return frame_res, None, None
+    def _fsqm_lifecycle_update(self):
+        """
+        FSQM online update: manage track lifecycle.
+        
+        - Track Termination: If confidence < tau_out for 3 consecutive frames, reset slot
+        - Track Initiation: If detection confidence > tau_in, fill first inactive slot
+        """
+        track_instances = self.track_instances
+        track_scores = track_instances.scores
+
+        # --- Track Termination ---
+        for i in range(len(track_instances)):
+            if track_instances.obj_idxes[i] >= 0:  # Active track
+                if track_scores[i] < self.tau_out:
+                    track_instances.low_conf_count[i] += 1
+                    if track_instances.low_conf_count[i] >= 3:
+                        # Reset to zero vector, ID = -1
+                        d = track_instances.query_pos.shape[1]
+                        track_instances.query_pos[i] = torch.zeros(d, device=track_instances.query_pos.device)
+                        track_instances.ref_pts[i] = torch.zeros(4, device=track_instances.ref_pts.device)
+                        track_instances.output_embedding[i] = torch.zeros(
+                            track_instances.output_embedding.shape[1], device=track_instances.output_embedding.device)
+                        track_instances.obj_idxes[i] = -1
+                        track_instances.pred_boxes[i] = torch.zeros(4, device=track_instances.pred_boxes.device)
+                        track_instances.scores[i] = 0.0
+                        track_instances.low_conf_count[i] = 0
+                else:
+                    track_instances.low_conf_count[i] = 0  # Reset counter
+
+        # --- Track Initiation ---
+        # Find high-confidence detections not yet assigned
+        det_indices = torch.where(
+            (track_instances.obj_idxes.view(-1) == -1) & (track_scores > self.tau_in)
+        )[0]
+
+        for det_idx in det_indices:
+            # Find first inactive slot
+            inactive_slots = torch.where(track_instances.obj_idxes.view(-1) == -1)[0]
+            if len(inactive_slots) == 0:
+                break
+            slot_idx = inactive_slots[0]
+
+            # Skip if det_idx is itself the slot (already inactive)
+            if det_idx == slot_idx:
+                track_instances.obj_idxes[slot_idx] = self.max_obj_id
+                self.max_obj_id += 1
+                track_instances.scores[slot_idx] = track_scores[det_idx]
+                track_instances.low_conf_count[slot_idx] = 0
+                continue
+
+            # Move detection to inactive slot
+            track_instances.query_pos[slot_idx] = track_instances.query_pos[det_idx].clone()
+            track_instances.ref_pts[slot_idx] = track_instances.ref_pts[det_idx].clone()
+            track_instances.output_embedding[slot_idx] = track_instances.output_embedding[det_idx].clone()
+            track_instances.pred_boxes[slot_idx] = track_instances.pred_boxes[det_idx].clone()
+            track_instances.pred_logits[slot_idx] = track_instances.pred_logits[det_idx].clone()
+            track_instances.scores[slot_idx] = track_scores[det_idx]
+            track_instances.obj_idxes[slot_idx] = self.max_obj_id
+            self.max_obj_id += 1
+            track_instances.low_conf_count[slot_idx] = 0
+
+            # Clear source slot
+            d = track_instances.query_pos.shape[1]
+            track_instances.query_pos[det_idx] = torch.zeros(d, device=track_instances.query_pos.device)
+            track_instances.ref_pts[det_idx] = torch.zeros(4, device=track_instances.ref_pts.device)
+            track_instances.output_embedding[det_idx] = torch.zeros(
+                track_instances.output_embedding.shape[1], device=track_instances.output_embedding.device)
+            track_instances.obj_idxes[det_idx] = -1
+            track_instances.pred_boxes[det_idx] = torch.zeros(4, device=track_instances.pred_boxes.device)
+            track_instances.scores[det_idx] = 0.0
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
-        m = self  # self.model[-1]  # Detect() module
+        m = self  # self.model[-1]  # Detect() class
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
@@ -543,7 +600,7 @@ class Pose(Detect):
     """YOLOv8 Pose head for keypoints models."""
 
     def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
-        """Initialize YOLO network with default parameters and Convolutional Layers."""
+        """Initialize the YOLO network with default parameters and Convolutional Layers."""
         super().__init__(nc, ch)
         self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
@@ -870,14 +927,10 @@ class MYDecoder(nn.Module):
 
         self._reset_parameters()
 
-    def forward(self, x, track_ref_pts=None, batch=None, is_first=False, pre_class=None, track_query_pos=None):
+    def forward(self, x, track_ref_pts=None, batch=None, is_first=False, pre_class=None, track_query_pos=None,
+                attn_mask=None):
         from ultralytics.models.utils.ops import get_track_cdn_group
 
-        # for l, feat in enumerate(x):
-        #     src, mask = feat.decompose()
-        #     srcs.append(self.input_proj[l](src))
-        #     masks.append(mask)
-        #     assert mask is not None
         # input projection and embedding
         feats, shapes = self._get_encoder_input(x)
 
@@ -903,7 +956,7 @@ class MYDecoder(nn.Module):
             track_cls_embed = None
             num_track_queries = 0
 
-        dn_embed, dn_bbox, attn_mask, dn_meta = \
+        dn_embed, dn_bbox, attn_mask_dn, dn_meta = \
             get_track_cdn_group(batch,
                                 self.nc,
                                 self.num_queries,
@@ -919,76 +972,41 @@ class MYDecoder(nn.Module):
                                     track_embed=track_cls_embed, pre_class=pre_class, track_query_pos=track_query_pos)
 
         track_ref_pts.to(enc_bboxes.device)
-        # track_query_pos = pos2posemb(track_ref_pts)
-
-        # track_query_pos = track_query_pos.unsqueeze(0)
-        #
-        # track_query_embed, _ = torch.split(track_query_pos, c, dim=1)
-        #
-        # track_query_embed = track_query_pos.expand(bs, -1, -1)
 
         if not self.training:
             refer_bbox = refer_bbox.to(embed.dtype)
-        #     enc_bboxes = enc_bboxes.to(embed.dtype)
-        #     enc_scores = enc_scores.to(embed.dtype)
-        #     track_query_embed = track_query_embed.to(embed.dtype)
-        #     track_ref_pts = track_ref_pts.to(embed.dtype)
 
-        # decoder  额，我这的定义和motr的不一样啊，我这的参数具体来说应该和上面那个detr的是一样的才对
+        # Merge DN attention mask with FSQM attention mask
+        # attn_mask_dn comes from DN group, attn_mask comes from FSQM
+        merged_attn_mask = attn_mask  # FSQM mask (for track+det queries)
+        if attn_mask_dn is not None and attn_mask is not None:
+            # Both masks exist: need to merge them
+            # DN mask handles DN-to-DN masking, FSQM mask handles track masking
+            # For simplicity, use FSQM mask (DN queries are always active)
+            merged_attn_mask = attn_mask
+        elif attn_mask_dn is not None:
+            merged_attn_mask = attn_mask_dn
+
+        # decoder
         dec_bboxes, dec_scores, dec_output_embeding = self.decoder(embed,
-                                                                   refer_bbox,
-                                                                   feats,
-                                                                   shapes,
-                                                                   self.dec_bbox_head,
-                                                                   self.dec_score_head,
-                                                                   self.query_pos_head,
-                                                                   attn_mask=attn_mask,
-                                                                   track_query_embed=query_pos
-                                                                   )
+                                                                    refer_bbox,
+                                                                    feats,
+                                                                    shapes,
+                                                                    self.dec_bbox_head,
+                                                                    self.dec_score_head,
+                                                                    self.query_pos_head,
+                                                                    attn_mask=merged_attn_mask,
+                                                                    track_query_embed=query_pos
+                                                                    )
 
-        # x = hs, inter_references, enc_bboxes, enc_scores, dn_meta
-
-        # if track_ref_pts is None:
-        #     reference_points = self.reference_points(track_query_embed).sigmoid()
-        # else:
         reference_points = track_ref_pts.repeat(bs, 1, 1).sigmoid()
 
         init_reference_out = reference_points
         dec_scores_out = dec_scores
 
-        ''' hs.size() in head torch.Size([6, 1, 498, 4])
-            init_reference_out.size() in head torch.Size([1, 300, 2])
-            inter_references_out.size() in head torch.Size([6, 1, 498, 5])
-            enc_scores.size() in head torch.Size([1, 300, 5])
-            'dn_num_group': 33, 'dn_num_split': [198, 300]
-            '''
-
-        ''' enc_bboxes.size() in head torch.Size([1, 300, 4])
-            dec_bboxes.size() in head torch.Size([6, 1, 492, 4])
-            enc_scores.size() in head torch.Size([1, 300, 5])
-            dec_scores.size() in head torch.Size([6, 1, 492, 5])
-
-        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta'''
-        # # 使用 torch.isnan 函数找到NaN值的索引
-        # nan_indices = torch.isnan(dec_bboxes)
-        #
-        # # 使用 torch.where 函数将NaN值替换为0
-        # dec_bboxes = torch.where(nan_indices, torch.tensor(0.0), dec_bboxes)
-        #
-        # # 使用 torch.isnan 函数找到NaN值的索引
-        # nan_indices = torch.isnan(dec_scores_out)
-        #
-        # # 使用 torch.where 函数将NaN值替换为0
-        # dec_scores_out = torch.where(nan_indices, torch.tensor(0.0), dec_scores_out)
         x = dec_bboxes, dec_scores_out, enc_bboxes, enc_scores, dn_meta, init_reference_out, dec_output_embeding
 
         return x
-
-        # if self.training:
-        #     return x
-        # # (bs, 300, 4+nc)
-        # y = torch.cat((dec_bboxes.squeeze(0), dec_scores_out.squeeze(0)), -1)
-        # return y if self.export else (y, x)
 
     def _generate_anchors(self, shapes, grid_size=0.05, dtype=torch.float32, device='cpu', eps=1e-2):
         anchors = []
@@ -1034,7 +1052,6 @@ class MYDecoder(nn.Module):
 
         # prepare input for decoder
         anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
-        # anchors, valid_mask = self._generate_anchors(shapes, dtype=torch.float32, device=feats.device)
 
         features = self.enc_output(valid_mask * feats)  # bs, h*w, 256
 
@@ -1057,23 +1074,10 @@ class MYDecoder(nn.Module):
             refer_bbox_1 = enc_outputs_bboxes[batch_ind, topk_ind].view(bs, self.num_queries, -1).to(
                 features.device)
             # 保证是self.num_queries
-            # refer_bbox_1 = refer_bbox_1[:, 0:self.num_queries - track_ref_pts.shape[0], :]
             refer_bbox = torch.cat([refer_bbox, refer_bbox_1], dim=1)
             if track_query_pos.device != refer_bbox_1.device:
                 track_query_pos = track_query_pos.to(refer_bbox_1.device)
             query_pos = torch.cat([track_query_pos.unsqueeze(0), pos2posemb(refer_bbox_1)], dim=1)
-
-            # if track_ref_pts.shape[0] < self.num_queries:
-            #     refer_bbox_1 = enc_outputs_bboxes[batch_ind, topk_ind].view(bs, self.num_queries, -1).to(
-            #         features.device)
-            #     # 保证是self.num_queries
-            #     refer_bbox_1 = refer_bbox_1[:, 0:self.num_queries - track_ref_pts.shape[0], :]
-            #     refer_bbox = torch.cat([refer_bbox, refer_bbox_1], dim=1)
-            #
-            # else:
-            #     refer_bbox = refer_bbox[:, 0:self.num_queries, :]
-
-        # refer_bbox = enc_outputs_bboxes[batch_ind, topk_ind].view(bs, self.num_queries, -1)
 
         enc_bboxes = refer_bbox.sigmoid()
 
@@ -1159,10 +1163,7 @@ class RuntimeTrackerBase(object):  # 实际为一个跟踪ID分配器
         for i in range(0, num_boxes):
             if keep[i]:
                 for j in range(i + 1, num_boxes):
-                    # if keep[j] and (instances.obj_idxes[j] not in self.prev_track_ids):
-                    # if keep[j] and instances.obj_idxes[j] > self.max_obj_id_pre:
                     if keep[j]:
-                        # iou = self._calculate_iou(pred_boxes, pred_boxes)
                         iou = self._calculate_iou(pred_boxes[i],
                                                   pred_boxes[j])
                         if iou > 0.8:
@@ -1208,38 +1209,13 @@ class RuntimeTrackerBase(object):  # 实际为一个跟踪ID分配器
         track_instances.scores = track_instances.scores.detach()
         track_instances.obj_idxes = track_instances.obj_idxes.to(device).detach()
         num_queries = len(track_instances)
-        # if self.training:
-        #     active_idxes = track_instances.obj_idxes >= 0
-        #     if torch.any(active_idxes).item():
-        #         active_track_instances = track_instances[active_idxes]
-        #     else:
-        #         return track_instances
-        #     import time
-        #     start_time = time.time()
-        #     if active_track_instances is not None:
-        #         keep_mask = self._filter_tracks(active_track_instances)
-        #         if len(keep_mask) != 0:
-        #             try:
-        #                 active_track_instances = active_track_instances[keep_mask]
-        #             except:
-        #                 # print(active_track_instances)
-        #                 active_track_instances = active_track_instances
-        #
-        #     end_time = time.time()
-        #     # print("耗时: {:.2f}ms".format((end_time - start_time) * 1000))
-        #     tmp_num = 0
-        #     return active_track_instances
         for i in range(len(track_instances.scores)):
-            # print(track_instances.obj_idxes[i])
-            # print(track_instances.scores[i])
             if track_instances.obj_idxes[i] == -1 and track_instances.scores[i] >= self.score_thresh:
                 track_instances.obj_idxes[i] = self.max_obj_id
                 self.max_obj_id += 1
             elif track_instances.obj_idxes[i] >= 0 and track_instances.scores[i] < self.filter_score_thresh:
                 track_instances.disappear_time[i] += 1
                 if track_instances.disappear_time[i] >= self.miss_tolerance:
-                    # Set the obj_id to -1.
-                    # Then this track will be removed by TrackEmbeddingLayer.
                     track_instances.obj_idxes[i] = -1
 
         active_track_idxes = track_instances.obj_idxes >= 0
@@ -1249,7 +1225,6 @@ class RuntimeTrackerBase(object):  # 实际为一个跟踪ID分配器
             active_track_instances = track_instances
             return active_track_instances
 
-        # active_track_instances = track_instances[track_instances.obj_idxes >= 0]
         import time
         start_time = time.time()
         if active_track_instances is not None:
@@ -1262,13 +1237,11 @@ class RuntimeTrackerBase(object):  # 实际为一个跟踪ID分配器
 
 
         end_time = time.time()
-        # print("过滤耗时: {:.2f}ms".format((end_time - start_time) * 1000))
         tmp_num = 0
 
         try:
             for i in range(len(active_track_instances.obj_idxes)):
                 if active_track_instances.obj_idxes[i] > (self.max_obj_id_pre):
-                    # print("track {} has score {}, assign obj_id {}".format(i, track_instances.scores[i], self.max_obj_id))
                     active_track_instances.obj_idxes[i] = self.max_obj_id_pre + tmp_num + 1
                     tmp_num += 1
         except:
@@ -1279,5 +1252,8 @@ class RuntimeTrackerBase(object):  # 实际为一个跟踪ID分配器
         else:
             self.max_obj_id = max(active_track_instances.obj_idxes.cpu()) + 1
             self.max_obj_id_pre = self.max_obj_id - 1
-            # self.prev_track_ids = active_track_instances.obj_idxes.clone().detach().cpu()
         return active_track_instances
+
+
+# Alias for YAML compatibility (must be after DecoderTracker class definition)
+MOTRTrack = DecoderTracker

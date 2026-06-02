@@ -698,7 +698,7 @@ class MOTRLoss(nn.Module):
         return [total_loss, num_trackobject]
 
 
-class MOTRTrackingLoss(MOTRLoss):
+class DecoderTrackingLoss(MOTRLoss):
 
     def forward(self, preds, batch, dn_bboxes=None, dn_scores=None, dn_meta=None, match_indices=None,
                 unmatched_track_idxes=None):

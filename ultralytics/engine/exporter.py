@@ -62,7 +62,7 @@ import torch
 
 from ultralytics.cfg import get_cfg
 from ultralytics.nn.autobackend import check_class_names
-from ultralytics.nn.modules import C2f, Detect, RTDETRDecoder,MOTRTrack
+from ultralytics.nn.modules import C2f, Detect, RTDETRDecoder,DecoderTracker
 from ultralytics.nn.tasks import DetectionModel, SegmentationModel
 from ultralytics.utils import (ARM64, DEFAULT_CFG, LINUX, LOGGER, MACOS, ROOT, WINDOWS, __version__, callbacks,
                                colorstr, get_default_args, yaml_save)

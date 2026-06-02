@@ -447,7 +447,7 @@ class BaseTrainer:
             except ImportError:
                 import pickle
             torch.save(ckpt, weights_path, pickle_module=pickle)
-            from ultralytics import MOTRTrack
+            from ultralytics import DecoderTracker
             device = next(self.model.model.parameters()).device
             # print(next(model.model.parameters()).device)
             # print(next(model.model.parameters()).device)
@@ -455,7 +455,7 @@ class BaseTrainer:
             # print(next(model.model.parameters()).device)
             # print(next(model.model.parameters()).device)
 
-            model = MOTRTrack(weights_path).model  # Create a new instance of the same model class
+            model = DecoderTracker(weights_path).model  # Create a new instance of the same model class
             ckpt = {
                 'epoch': self.epoch,
                 'best_fitness': self.best_fitness,

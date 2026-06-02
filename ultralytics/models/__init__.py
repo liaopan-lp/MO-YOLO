@@ -1,5 +1,5 @@
 from .rtdetr import RTDETR
 from .sam import SAM
-from .MOTRtrack import MOTRTrack
+from .DecoderTracker import DecoderTracker
 
-__all__ = 'RTDETR', 'SAM', 'MOTRTrack'  # allow simpler import
+__all__ = 'RTDETR', 'SAM', 'DecoderTracker'  # allow simpler import

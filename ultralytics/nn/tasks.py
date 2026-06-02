@@ -9,7 +9,7 @@ import torch.nn as nn
 # from ultralytics.nn import guess_model_scale, __all__, guess_model_task, torch_safe_load
 
 from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
-                                    Classify, Concat, Conv, Conv2, ConvTranspose, Detect, MOTRTrack, DWConv,
+                                    Classify, Concat, Conv, Conv2, ConvTranspose, Detect, DecoderTracker, MOTRTrack, DWConv,
                                     DWConvTranspose2d,
                                     Focus, GhostBottleneck, GhostConv, HGBlock, HGStem, Pose, RepC3, RepConv,
                                     RTDETRDecoder, Segment)
@@ -303,10 +303,10 @@ class TrackingModel(DetectionModel):
 
     def init_criterion(self):
         """Compute the classification loss between predictions and true labels."""
-        from ultralytics.utils.loss import MOTRTrackingLoss
+        from ultralytics.utils.loss import DecoderTrackingLoss
 
         # return v8TrackingLoss(nc=self.nc, use_vfl=True)
-        return MOTRTrackingLoss(nc=self.nc, use_vfl=True)
+        return DecoderTrackingLoss(nc=self.nc, use_vfl=True)
 
     def loss(self, batch, preds=None, is_first=False):
         if not hasattr(self, 'criterion'):
@@ -833,7 +833,7 @@ def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
     # Module compatibility updates
     for m in ensemble.modules():
         t = type(m)
-        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Segment, MOTRTrack):
+        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Segment, DecoderTracker):
             m.inplace = inplace  # torch 1.7.0 compatibility
         elif t is nn.Upsample and not hasattr(m, 'recompute_scale_factor'):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
@@ -870,7 +870,7 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     # Module compatibility updates
     for m in model.modules():
         t = type(m)
-        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Segment, MOTRTrack):
+        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Segment, DecoderTracker):
             m.inplace = inplace  # torch 1.7.0 compatibility
         elif t is nn.Upsample and not hasattr(m, 'recompute_scale_factor'):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
@@ -885,6 +885,7 @@ def parse_model(d, ch, verbose=True, is_track=False):  # model_dict, input_chann
     # Args
     max_channels = float('inf')
     nc, act, scales = (d.get(x) for x in ('nc', 'activation', 'scales'))
+    use_fsqm = d.get('use_fsqm', True)  # whether to use FSQM in DecoderTracker
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ('depth_multiple', 'width_multiple', 'kpt_shape'))
     if scales:
         scale = d.get('scale')
@@ -935,8 +936,12 @@ def parse_model(d, ch, verbose=True, is_track=False):  # model_dict, input_chann
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in (Detect, Segment, Pose, RTDETRDecoder, MOTRTrack):
+        elif m in (Detect, Segment, Pose, RTDETRDecoder, DecoderTracker, MOTRTrack):
             args.append([ch[x] for x in f])
+            if m is DecoderTracker or m is MOTRTrack:
+                args.append(use_fsqm)  # pass use_fsqm to DecoderTracker head
+                training_stage = d.get('training_stage', 3)  # default stage 3
+                args.append(training_stage)  # pass training_stage
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         else:
@@ -1041,7 +1046,7 @@ def guess_model_task(model):
                 return 'classify'
             elif isinstance(m, Pose):
                 return 'pose'
-            elif isinstance(m, MOTRTrack):
+            elif isinstance(m, DecoderTracker):
                 return 'track'
 
     # Guess from model filename

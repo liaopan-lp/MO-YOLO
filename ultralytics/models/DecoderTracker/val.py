@@ -18,6 +18,8 @@ from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import colorstr, ops, callbacks
 from ultralytics.utils.hota import HOTA
+from ultralytics.utils.clear import CLEAR
+from ultralytics.utils.identity import Identity
 
 __all__ = 'TrackValidator',  # tuple or list
 
@@ -256,6 +258,14 @@ class TrackValidator(DetectionValidator):
         video_name = ""
         self.data_hota = {}
         hota = HOTA()
+        clear = CLEAR()
+        identity = Identity()
+
+        # Store results from each video sequence for all three metric families
+        all_hota_results = {}
+        all_clear_results = {}
+        all_identity_results = {}
+        video_idx = 0
 
         num_tracker_dets = 0
         num_gt_dets = 0
@@ -307,13 +317,31 @@ class TrackValidator(DetectionValidator):
                         similarity_scores.append(ious)
                     self.data_hota['similarity_scores'] = similarity_scores
 
-                    tracking_hota = hota.eval_sequence(data=self.data_hota)  # emmmm先不要
-                    # 记得取消注释
-                    # print('')
-                    # print(video_name + ':')
-                    # print('HOTA:', tracking_hota)
-                    # print('')
-                    # print('其他一些完整数据', tracking_hota)
+                    # Compute all three metric families for this video sequence
+                    seq_hota = hota.eval_sequence(data=self.data_hota)
+                    seq_clear = clear.eval_sequence(data=self.data_hota)
+                    seq_identity = identity.eval_sequence(data=self.data_hota)
+
+                    # Store results keyed by video name
+                    all_hota_results[video_name] = seq_hota
+                    all_clear_results[video_name] = seq_clear
+                    all_identity_results[video_name] = seq_identity
+                    video_idx += 1
+
+                    # Print per-video results
+                    LOGGER.info(f'\n{"="*60}')
+                    LOGGER.info(f'Video: {video_name}')
+                    LOGGER.info(f'{"="*60}')
+                    LOGGER.info(f'  HOTA:    {np.mean(seq_hota["HOTA"]):.4f}  '
+                                f'(DetA={np.mean(seq_hota["DetA"]):.4f}, AssA={np.mean(seq_hota["AssA"]):.4f})')
+                    LOGGER.info(f'  MOTA:    {seq_clear["MOTA"]:.4f}  '
+                                f'(FP={seq_clear["CLR_FP"]}, FN={seq_clear["CLR_FN"]}, IDSW={seq_clear["IDSW"]})')
+                    LOGGER.info(f'  MOTP:    {seq_clear["MOTP"]:.4f}')
+                    LOGGER.info(f'  IDF1:    {seq_identity["IDF1"]:.4f}  '
+                                f'(IDR={seq_identity["IDR"]:.4f}, IDP={seq_identity["IDP"]:.4f})')
+                    LOGGER.info(f'  CLR_Re:  {seq_clear["CLR_Re"]:.4f}  CLR_Pr: {seq_clear["CLR_Pr"]:.4f}')
+                    LOGGER.info(f'  MT={seq_clear["MT"]}  PT={seq_clear["PT"]}  ML={seq_clear["ML"]}')
+
                     self.data_hota = {}
                     track_truth_datas[frame_count] = batch
                     track_pred_datas[frame_count] = track_instances
@@ -481,6 +509,94 @@ class TrackValidator(DetectionValidator):
                 self.plot_predictions(batch, preds, batch_i)
 
             self.run_callbacks('on_val_batch_end')
+
+        # Handle the last video sequence (no boundary trigger for the last video)
+        try:
+            if self.data_hota.get('gt_ids') and len(self.data_hota.get('gt_ids', [])) > 0:
+                self.data_hota['num_tracker_dets'] = num_tracker_dets
+                self.data_hota['num_gt_dets'] = num_gt_dets
+                self.data_hota['num_tracker_ids'] = len(unique_tracker_ids)
+                self.data_hota['num_gt_ids'] = len(unique_gt_ids)
+
+                similarity_scores = []
+                for t, (gt_dets_t, tracker_dets_t) in enumerate(
+                        zip(self.data_hota['gt_dets'], self.data_hota['tracker_dets'])):
+                    try:
+                        ious = self._calculate_hota_similarities(gt_dets_t, tracker_dets_t)
+                    except:
+                        tracker_dets_t = np.array([[0, 0, 1, 1]])
+                        ious = self._calculate_hota_similarities(gt_dets_t, tracker_dets_t)
+                    similarity_scores.append(ious)
+                self.data_hota['similarity_scores'] = similarity_scores
+
+                seq_hota = hota.eval_sequence(data=self.data_hota)
+                seq_clear = clear.eval_sequence(data=self.data_hota)
+                seq_identity = identity.eval_sequence(data=self.data_hota)
+
+                all_hota_results[video_name] = seq_hota
+                all_clear_results[video_name] = seq_clear
+                all_identity_results[video_name] = seq_identity
+
+                LOGGER.info(f'\n{"="*60}')
+                LOGGER.info(f'Video: {video_name}')
+                LOGGER.info(f'{"="*60}')
+                LOGGER.info(f'  HOTA:    {np.mean(seq_hota["HOTA"]):.4f}  '
+                            f'(DetA={np.mean(seq_hota["DetA"]):.4f}, AssA={np.mean(seq_hota["AssA"]):.4f})')
+                LOGGER.info(f'  MOTA:    {seq_clear["MOTA"]:.4f}  '
+                            f'(FP={seq_clear["CLR_FP"]}, FN={seq_clear["CLR_FN"]}, IDSW={seq_clear["IDSW"]})')
+                LOGGER.info(f'  MOTP:    {seq_clear["MOTP"]:.4f}')
+                LOGGER.info(f'  IDF1:    {seq_identity["IDF1"]:.4f}  '
+                            f'(IDR={seq_identity["IDR"]:.4f}, IDP={seq_identity["IDP"]:.4f})')
+                LOGGER.info(f'  CLR_Re:  {seq_clear["CLR_Re"]:.4f}  CLR_Pr: {seq_clear["CLR_Pr"]:.4f}')
+                LOGGER.info(f'  MT={seq_clear["MT"]}  PT={seq_clear["PT"]}  ML={seq_clear["ML"]}')
+        except Exception as e:
+            LOGGER.warning(f'Error computing metrics for last video sequence: {e}')
+
+        # Print overall summary across all videos
+        if len(all_hota_results) > 0:
+            LOGGER.info(f'\n{"="*60}')
+            LOGGER.info(f'Overall Tracking Metrics Summary ({len(all_hota_results)} videos)')
+            LOGGER.info(f'{"="*60}')
+
+            # HOTA: average across all videos
+            avg_hota = np.mean([np.mean(v['HOTA']) for v in all_hota_results.values()])
+            avg_deta = np.mean([np.mean(v['DetA']) for v in all_hota_results.values()])
+            avg_assa = np.mean([np.mean(v['AssA']) for v in all_hota_results.values()])
+            LOGGER.info(f'  HOTA:  {avg_hota:.4f}  (DetA={avg_deta:.4f}, AssA={avg_assa:.4f})')
+
+            # CLEAR: aggregate counts then compute
+            total_tp = sum(v['CLR_TP'] for v in all_clear_results.values())
+            total_fn = sum(v['CLR_FN'] for v in all_clear_results.values())
+            total_fp = sum(v['CLR_FP'] for v in all_clear_results.values())
+            total_idsw = sum(v['IDSW'] for v in all_clear_results.values())
+            total_gt = total_tp + total_fn
+            total_tracker = total_tp + total_fp
+
+            overall_mota = 1.0 - (total_fn + total_fp + total_idsw) / total_gt if total_gt > 0 else 0.0
+            overall_motp_vals = [v['MOTP'] * v['CLR_TP'] for v in all_clear_results.values() if v['CLR_TP'] > 0]
+            overall_motp = sum(overall_motp_vals) / total_tp if total_tp > 0 else 0.0
+            overall_clr_re = total_tp / total_gt if total_gt > 0 else 0.0
+            overall_clr_pr = total_tp / total_tracker if total_tracker > 0 else 0.0
+            total_mt = sum(v['MT'] for v in all_clear_results.values())
+            total_pt = sum(v['PT'] for v in all_clear_results.values())
+            total_ml = sum(v['ML'] for v in all_clear_results.values())
+
+            LOGGER.info(f'  MOTA:  {overall_mota:.4f}  (FP={total_fp}, FN={total_fn}, IDSW={total_idsw})')
+            LOGGER.info(f'  MOTP:  {overall_motp:.4f}')
+            LOGGER.info(f'  CLR_Re:{overall_clr_re:.4f}  CLR_Pr:{overall_clr_pr:.4f}')
+            LOGGER.info(f'  MT={total_mt}  PT={total_pt}  ML={total_ml}')
+
+            # Identity: aggregate counts then compute
+            total_idtp = sum(v['IDTP'] for v in all_identity_results.values())
+            total_idfn = sum(v['IDFN'] for v in all_identity_results.values())
+            total_idfp = sum(v['IDFP'] for v in all_identity_results.values())
+            overall_idr = total_idtp / (total_idtp + total_idfn) if (total_idtp + total_idfn) > 0 else 0.0
+            overall_idp = total_idtp / (total_idtp + total_idfp) if (total_idtp + total_idfp) > 0 else 0.0
+            overall_idf1 = 2 * total_idtp / (2 * total_idtp + total_idfn + total_idfp) if (
+                    2 * total_idtp + total_idfn + total_idfp) > 0 else 0.0
+            LOGGER.info(f'  IDF1:  {overall_idf1:.4f}  (IDR={overall_idr:.4f}, IDP={overall_idp:.4f})')
+            LOGGER.info(f'{"="*60}\n')
+
         stats = self.get_stats()
         self.check_stats(stats)
         self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))

@@ -365,7 +365,7 @@ class ModelEMA:
         #     except ImportError:
         #         import pickle
         #     torch.save(ckpt, weights_path, pickle_module=pickle)
-        #     from ultralytics import MOTRTrack
+        #     from ultralytics import DecoderTracker
         #     device = next(model.model.parameters()).device
         #     # print(next(model.model.parameters()).device)
         #     # print(next(model.model.parameters()).device)
@@ -373,7 +373,7 @@ class ModelEMA:
         #     # print(next(model.model.parameters()).device)
         #     # print(next(model.model.parameters()).device)
         #
-        #     self.ema = MOTRTrack(weights_path).model  # Create a new instance of the same model class
+        #     self.ema = DecoderTracker(weights_path).model  # Create a new instance of the same model class
         #     self.ema.to(device)
         #     self.ema.eval()  # Set the EMA model to evaluation mode
         #

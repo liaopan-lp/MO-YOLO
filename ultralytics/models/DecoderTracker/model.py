@@ -19,9 +19,11 @@ from .train import TrackTrainer
 from .val import TrackValidator
 
 
-class MOTRTrack:
+class DecoderTracker:
 
-    def __init__(self, model='rtdetr-l.pt', pretrain_rtdetr_model=None) -> None:
+    def __init__(self, model='rtdetr-l.pt', pretrain_rtdetr_model=None, use_fsqm=True, training_stage=3) -> None:
+        self.use_fsqm = use_fsqm
+        self.training_stage = training_stage
         if pretrain_rtdetr_model is None:
             if model and not model.endswith('.pt') and not model.endswith('.yaml'):
                 raise NotImplementedError('This model only supports creating from pt file or yaml file.')
@@ -95,6 +97,8 @@ class MOTRTrack:
 
     def _new(self, cfg: str, verbose=True):
         cfg_dict = yaml_model_load(cfg)
+        cfg_dict['use_fsqm'] = self.use_fsqm  # pass use_fsqm to model config
+        cfg_dict['training_stage'] = self.training_stage  # pass training_stage to model config
         self.cfg = cfg
         self.task = 'track'
         self.model = TrackingModel(cfg_dict, verbose=verbose)  # build model

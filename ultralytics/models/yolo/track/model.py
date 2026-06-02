@@ -19,7 +19,7 @@ from .train import TrackTrainer
 from .val import TrackValidator
 
 
-class MOTRTrack:
+class DecoderTracker:
 
     def __init__(self, model='rtdetr-l.pt') -> None:
         if model and not model.endswith('.pt') and not model.endswith('.yaml'):
