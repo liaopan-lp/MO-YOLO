@@ -282,11 +282,16 @@ This project builds upon the following excellent works:
 If you find this work useful in your research, please consider citing:
 
 ```bibtex
-@article{decodertracker2026,
-  title={MO-YOLO: Multi-Object Tracking with YOLO-Based Decoder},
-  journal={Pattern Recognition},
-  year={2026},
-  publisher={Elsevier}
+@article{LIAO2026113242,
+title = {DecoderTracker: Decoder-only end-to-end method for multiple-object tracking},
+journal = {Pattern Recognition},
+volume = {177},
+pages = {113242},
+year = {2026},
+issn = {0031-3203},
+doi = {https://doi.org/10.1016/j.patcog.2026.113242},
+url = {https://www.sciencedirect.com/science/article/pii/S0031320326002074},
+author = {Pan Liao and Feng Yang and Di Wu and Wenhui Zhao and Jinwen Yu and Dingwen Zhang},
 }
 ```
 
