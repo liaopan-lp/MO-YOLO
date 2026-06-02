@@ -272,7 +272,7 @@ DecoderTracker/
 This project builds upon the following excellent works:
 
 - **[Ultralytics](https://github.com/ultralytics/ultralytics/)**: The YOLO framework providing the backbone and training infrastructure.
-- **[MOTR](https://github.com/megvii-research/MOTR)**: End-to-End Multiple-Object Tracking with Transformer, providing the TALA and TBSP training strategies.
+- **[MOTR](https://github.com/megvii-research/MOTR)**: End-to-End Multiple-Object Tracking with Transformer, providing the TALA training strategy and some modules.
 - **[TrackEval](https://github.com/JonathonLuiten/TrackEval)**: Comprehensive tracking evaluation metrics.
 
 ---
