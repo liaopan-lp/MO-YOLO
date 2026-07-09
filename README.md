@@ -155,6 +155,7 @@ model.train(data="dancetracker.yaml", epochs=50, batch=8)
 ### Stage 2: TBSP Training (Weak Tracking)
 Introduce TBSP (Tracking Box Selection Process) as weak supervision. Track queries are maintained across frames, and detect queries overlapping with track queries are filtered out.
 
+时间太久了权重找不到了，这篇论文，2025.3那次修改之后好像就没补过实验
 ```python
 model = DecoderTracker("yolo_track.yaml", use_fsqm=True, training_stage=2)
 model.load("path/to/stage1_best.pt")
