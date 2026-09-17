@@ -133,7 +133,7 @@ dmypy.json
 .pyre/
 
 # datasets and projects
-datasets/
+/datasets/
 runs/
 wandb/
 

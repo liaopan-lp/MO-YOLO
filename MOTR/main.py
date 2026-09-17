@@ -20,14 +20,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import MOTR.datasets
-from MOTR import datasets
 
 from MOTR.util.motdet_eval import motdet_evaluate, detmotdet_evaluate
 from MOTR.util.tool import load_model
 import MOTR.util.misc as utils
-import MOTR.datasets.samplers as samplers
-from MOTR.datasets import build_dataset, get_coco_api_from_dataset
 from MOTR.engine import evaluate, train_one_epoch, train_one_epoch_mot
 from MOTR.models import build_model
 
@@ -203,6 +199,16 @@ def main(args):
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
+
+    # MOTR/datasets/ is NOT present in this repository (it was excluded by an
+    # unanchored `datasets/` rule in .gitignore). Imported here rather than at module
+    # scope so that importing MOTR.main -- which the DecoderTracker head does, for
+    # get_args_parser -- does not require a package this path never uses.
+    # MOTR's own main() still needs the real package restored to run.
+    import MOTR.datasets
+    from MOTR import datasets
+    import MOTR.datasets.samplers as samplers
+    from MOTR.datasets import build_dataset, get_coco_api_from_dataset
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)

@@ -435,7 +435,10 @@ class BaseTrainer:
                 'date': datetime.now().isoformat(),
                 'version': __version__}
         except:
-            weights_path = 'weights_temp.pt'
+            # Unique per process: this fallback lives in the shared working directory,
+            # so a bare 'weights_temp.pt' lets two concurrent runs race -- one removes
+            # the file the other just wrote, and the loser fails at os.remove below.
+            weights_path = f'weights_temp_{os.getpid()}.pt'
             ckpt = {
                 'model': de_parallel(self.model),
                 'ema': self.model

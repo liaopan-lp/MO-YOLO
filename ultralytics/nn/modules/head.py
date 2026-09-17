@@ -103,7 +103,7 @@ class DecoderTracker(nn.Module):
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
 
-    def __init__(self, nc=80, ch=(), use_fsqm=True, d_model=256, aux_loss=False, nq=300, training_stage=3):  # detection layer
+    def __init__(self, nc=80, ch=(), use_fsqm=True, training_stage=3, d_model=256, aux_loss=False, nq=300):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
@@ -135,11 +135,6 @@ class DecoderTracker(nn.Module):
         else:
             self.matcher = None
 
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
-
         # Track instances storage
         self.track_instances = None
         self.track_instances_pre = None
@@ -150,29 +145,68 @@ class DecoderTracker(nn.Module):
         self.tau_out = 0.3  # threshold for track termination
         self.max_obj_id = 0 # global ID counter
 
+    def _state_needs_reset(self):
+        """True when the cached tracking state does not match this module.
+
+        The state can arrive from a checkpoint -- it is a plain attribute, so
+        torch.save pickles it and neither .to(device) nor .half() ever moves it --
+        in which case it comes back on cpu and in the checkpoint's dtype. Reusing it
+        builds the FSQM attention mask on the wrong device and self-attention dies:
+            RuntimeError: Expected all tensors to be on the same device, but got
+            batch1 is on cuda:0, different from other tensors on cpu
+
+        Checked in forward() rather than only at load time, because the model can
+        also be moved (.to/.half) after the state was created.
+
+        DEVICE ONLY -- deliberately not dtype. Under autocast/AMP the decoder outputs
+        are fp16 while the parameters stay fp32, and the state is refreshed from
+        those outputs every frame, so a dtype test against the parameter dtype would
+        fire on every single frame and silently wipe the tracking memory. The dtype
+        half of the original symptom is already handled: the state is rebuilt on the
+        first frame with the module's own dtype.
+        """
+        ti = self.track_instances
+        if ti is None:
+            return False
+        device, _ = self._state_device_dtype()
+        for name in ("ref_pts", "obj_idxes", "pred_logits", "query_pos"):
+            t = getattr(ti, name, None)
+            if torch.is_tensor(t) and t.device != device:
+                return True
+        return False
+
+    def _state_device_dtype(self):
+        """Device and floating dtype for the tracking state.
+
+        Taken from this head's own parameters, so the state always agrees with the
+        module it is used with (DataParallel, cuda:1, fp16 validation, ...).
+        """
+        try:
+            ref = next(self.parameters())
+        except StopIteration:
+            return torch.device("cpu"), torch.float32
+        return ref.device, ref.dtype
+
     def _generate_empty_tracks(self, len_before=0):
         from MOTR.models.structures import Instances
         track_instances = Instances((1, 1))
         num_queries, dim = self.decoder.num_queries, self.decoder.hidden_dim * 2
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
+        device, dtype = self._state_device_dtype()
 
         # Fixed-size memory pool: N_m queries, all initialized to zero
-        track_instances.ref_pts = torch.zeros(num_queries, 4, device=device)
-        track_instances.query_pos = torch.zeros((num_queries, 256), dtype=torch.float, device=device)
-        track_instances.output_embedding = torch.zeros((num_queries, dim >> 1), device=device)
+        track_instances.ref_pts = torch.zeros(num_queries, 4, device=device, dtype=dtype)
+        track_instances.query_pos = torch.zeros((num_queries, 256), dtype=dtype, device=device)
+        track_instances.output_embedding = torch.zeros((num_queries, dim >> 1), device=device, dtype=dtype)
         
         # Global ID pool: all inactive (-1)
         track_instances.obj_idxes = torch.full((len(track_instances), 1), -1, dtype=torch.long, device=device)
         track_instances.matched_gt_idxes = torch.full((len(track_instances),), -1, dtype=torch.long, device=device)
         track_instances.disappear_time = torch.zeros((len(track_instances), 1), dtype=torch.long, device=device)
-        track_instances.iou = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
-        track_instances.scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
-        track_instances.track_scores = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_logits = torch.zeros((len(track_instances), self.nc), dtype=torch.float, device=device)
+        track_instances.iou = torch.zeros((len(track_instances),), dtype=dtype, device=device)
+        track_instances.scores = torch.zeros((len(track_instances),), dtype=dtype, device=device)
+        track_instances.track_scores = torch.zeros((len(track_instances), 4), dtype=dtype, device=device)
+        track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=dtype, device=device)
+        track_instances.pred_logits = torch.zeros((len(track_instances), self.nc), dtype=dtype, device=device)
 
         # FSQM: consecutive low-confidence frame counter
         track_instances.low_conf_count = torch.zeros((len(track_instances),), dtype=torch.long, device=device)
@@ -269,7 +303,7 @@ class DecoderTracker(nn.Module):
         else:
             self.is_first = is_first
 
-        if self.is_first or self.track_instances is None:
+        if self.is_first or self.track_instances is None or self._state_needs_reset():
             # Initialize fixed-size track memory (all zeros, all IDs=-1)
             self.track_instances = self._generate_empty_tracks()
             self.track_base = RuntimeTrackerBase(training=self.training)
@@ -329,6 +363,9 @@ class DecoderTracker(nn.Module):
             dn_bboxes, dec_bboxes = torch.split(dec_bboxes, enc_outputs_coord_unact['dn_num_split'], dim=2)
             _, init_reference = torch.split(init_reference, enc_outputs_coord_unact['dn_num_split'], dim=1)
             dn_scores, dec_scores = torch.split(dec_scores, enc_outputs_coord_unact['dn_num_split'], dim=2)
+            # (bs, L, d): split along the TOKEN axis, same as the three above.
+            _, dec_output_embeding = torch.split(
+                dec_output_embeding, enc_outputs_coord_unact['dn_num_split'], dim=1)
 
         # Compute reference points across all decoder layers
         outputs_coords = []
@@ -353,7 +390,7 @@ class DecoderTracker(nn.Module):
         all_pred_logits = outputs_class[-1]   # (bs, 2*N_m, nc)
         all_pred_boxes = outputs_coord[-1]    # (bs, 2*N_m, 4)
         all_ref_pts = ref_pts_all[-1]         # (bs, 2*N_m, 4)
-        all_hs = dec_output_embeding[-1]      # (bs, 2*N_m, d)
+        all_hs = dec_output_embeding      # (bs, 2*N_m, d)
 
         # Split into track queries (first N_m) and detect queries (last N_m)
         nm = self.nq
@@ -364,9 +401,15 @@ class DecoderTracker(nn.Module):
 
         # Update track_instances with track query outputs only (N_m entries)
         self.track_instances.scores = track_scores
-        self.track_instances.pred_logits = track_pred_logits[0]  # (N_m, nc)
-        self.track_instances.pred_boxes = track_pred_boxes[0]    # (N_m, 4)
-        self.track_instances.output_embedding = track_hs[0]      # (N_m, d)
+        # .clone() (not .detach()): these three are mutated in place by
+        # _fsqm_lifecycle_update below, but they arrive as views of the decoder outputs
+        # (torch.split returns multi-view results, which autograd forbids mutating:
+        # 'Output 0 of SelectBackward0 is a view and is being modified inplace').
+        # A detached copy would silence that too, but would also cut the gradient --
+        # nn/tasks.py feeds these very tensors into the loss.
+        self.track_instances.pred_logits = track_pred_logits[0].clone()  # (N_m, nc)
+        self.track_instances.pred_boxes = track_pred_boxes[0].clone()    # (N_m, 4)
+        self.track_instances.output_embedding = track_hs[0].clone()      # (N_m, d)
 
         # Lifecycle management: FSQM or default tracker
         if self.use_fsqm:
@@ -387,7 +430,7 @@ class DecoderTracker(nn.Module):
 
             if is_first or not (self.track_instances.obj_idxes != -1).any():
                 # First frame or no active tracks: match all with GT
-                indices = self.matcher(track_pred_boxes.unsqueeze(0), track_pred_logits.unsqueeze(0),
+                indices = self.matcher(track_pred_boxes, track_pred_logits,
                                        batch['bboxes'], batch['cls'], batch['gt_groups'])
                 indices = [(ind[0].to(pred_logits_i.device), ind[1].to(pred_logits_i.device)) for ind in indices]
 
@@ -482,8 +525,9 @@ class DecoderTracker(nn.Module):
         out_track_instances = self.track_embed(tmp)
 
         # Update track instances with QIM outputs (N_m entries preserved)
-        self.track_instances.ref_pts = out_track_instances.ref_pts
-        self.track_instances.query_pos = out_track_instances.query_pos
+        # Same ownership reason as above: the FSQM lifecycle mutates these in place.
+        self.track_instances.ref_pts = out_track_instances.ref_pts.clone()
+        self.track_instances.query_pos = out_track_instances.query_pos.clone()
 
         if self.training:
             return [matched_indices, unmatched_track_idxes]
@@ -971,21 +1015,44 @@ class MYDecoder(nn.Module):
             self._get_decoder_input(feats, shapes, dn_embed, dn_bbox, track_ref_pts, is_first=is_first,
                                     track_embed=track_cls_embed, pre_class=pre_class, track_query_pos=track_query_pos)
 
-        track_ref_pts.to(enc_bboxes.device)
+        track_ref_pts = track_ref_pts.to(enc_bboxes.device)
 
         if not self.training:
             refer_bbox = refer_bbox.to(embed.dtype)
 
-        # Merge DN attention mask with FSQM attention mask
-        # attn_mask_dn comes from DN group, attn_mask comes from FSQM
-        merged_attn_mask = attn_mask  # FSQM mask (for track+det queries)
-        if attn_mask_dn is not None and attn_mask is not None:
-            # Both masks exist: need to merge them
-            # DN mask handles DN-to-DN masking, FSQM mask handles track masking
-            # For simplicity, use FSQM mask (DN queries are always active)
+        # Merge the denoising mask with the FSQM mask into ONE ADDITIVE FLOAT mask.
+        #
+        # The decoder input is [dn_embed, track_embed, detect_embed], so the mask must be
+        # square over num_dn + 2*N_m tokens. attn_mask_dn is already that full size; the
+        # FSQM mask covers only the trailing 2*N_m block. Previously the DN mask was
+        # discarded whenever both existed, which lost the DN-to-DN masking entirely and
+        # fed a (2*N_m) mask to a (num_dn + 2*N_m) attention.
+        #
+        # Why float and not bool: masked positions must be a large FINITE negative, not
+        # -inf and not bool-true. An inactive track slot is masked against every column,
+        # and for such a fully-masked row a bool mask or an -inf mask makes softmax
+        # return NaN, while -1e4 gives a finite uniform row. (Measured on this stack.)
+        # The dtype conversion at the end is required in the other direction: a float32
+        # mask combined with fp16 operands raises 'Input dtypes must be the same, got:
+        # input float, batch1 is on c10::Half'.
+        #
+        # Note also that a float mask is ADDED to the logits -- so a 0.0/1.0 float mask
+        # would block nothing. The sentinel must stay large and negative.
+        _NEG = -1e4
+        n_tokens = embed.shape[1]
+        if attn_mask_dn is not None:
+            assert attn_mask_dn.shape[0] == n_tokens, (tuple(attn_mask_dn.shape), n_tokens)
+            merged_attn_mask = torch.zeros(
+                n_tokens, n_tokens, device=embed.device, dtype=torch.float32)
+            merged_attn_mask.masked_fill_(attn_mask_dn, _NEG)
+            if attn_mask is not None:
+                n_dn = n_tokens - attn_mask.shape[0]
+                assert n_dn >= 0, (n_tokens, tuple(attn_mask.shape))
+                merged_attn_mask[n_dn:, n_dn:] = attn_mask
+        else:
             merged_attn_mask = attn_mask
-        elif attn_mask_dn is not None:
-            merged_attn_mask = attn_mask_dn
+        if merged_attn_mask is not None and merged_attn_mask.dtype != embed.dtype:
+            merged_attn_mask = merged_attn_mask.to(embed.dtype)
 
         # decoder
         dec_bboxes, dec_scores, dec_output_embeding = self.decoder(embed,

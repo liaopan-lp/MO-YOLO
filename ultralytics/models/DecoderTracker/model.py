@@ -52,10 +52,32 @@ class DecoderTracker:
 
             self._load_pretrain_detr(pretrain_rtdetr_model)
 
+        self._reset_tracking_state()
+
+    def _reset_tracking_state(self):
+        """Drop per-sequence tracking state left over from a checkpoint.
+
+        `track_instances` is a plain attribute on the head, so torch.save pickles it
+        into the .pt and .to(device) does not move it -- on reload it comes back on
+        cpu and in whatever dtype the checkpoint was saved with, and the first
+        forward then builds its attention mask on the wrong device.
+
+        Tracking state belongs to a sequence; a freshly loaded model has seen no
+        frames, so it must start empty.
+        """
+        model = getattr(self, 'model', None)
+        if model is None:
+            return
+        for module in model.modules():
+            if hasattr(module, 'track_instances'):
+                module.track_instances = None
+            if hasattr(module, 'max_obj_id'):
+                module.max_obj_id = 0
+
     def _load_pretrain_detr(self, weights: str):
         import torch
         # 加载 RTDETRDetectionModel 的权重
-        checkpoint = torch.load(weights)
+        checkpoint = torch.load(weights, weights_only=False)
         # 获取 RTDETRDetectionModel 的权重字典
         model_weights = {}
         for name, param in checkpoint['model'].model.named_parameters():
@@ -171,6 +193,13 @@ class DecoderTracker:
         """
         overrides = dict(task='track', mode='train')
         overrides.update(kwargs)
+        # DETR-style transformer: ultralytics' optimizer='auto' heuristic resolves to
+        # AdamW(lr=0.002) for this model, which diverges to NaN within a few steps
+        # (measured with AMP both on and off). MOTR trains at 2e-4. Only applied when
+        # the caller has not asked for something specific.
+        if overrides.get('optimizer', 'auto') == 'auto':
+            overrides['optimizer'] = 'AdamW'
+            overrides.setdefault('lr0', 2e-4)
         overrides['deterministic'] = False
         if not overrides.get('data'):
             raise AttributeError("Dataset required but missing, i.e. pass 'data=coco128.yaml'")
