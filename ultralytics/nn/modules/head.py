@@ -412,8 +412,34 @@ class DecoderTracker(nn.Module):
         self.track_instances.output_embedding = track_hs[0].clone()      # (N_m, d)
 
         # Lifecycle management: FSQM or default tracker
+        # Rows to spawn new tracks from.
+        #
+        # Prefer the DETECT half (rows N_m:2*N_m), which is what actually detects and
+        # where MOTR/models/fsqm.py `inject_new_queries` takes its candidates from. The
+        # state above stores only the track half, so the detect rows must be handed to
+        # the lifecycle explicitly.
+        #
+        # On a sequence's FIRST frame the decoder is fed track queries only -- no detect
+        # queries are appended -- so there is no detect half to use. Fall back to the
+        # track half there, otherwise the first frame of every sequence would produce no
+        # tracks at all.
+        if all_pred_logits.shape[1] > nm:
+            src_logits = all_pred_logits[0, nm:, :]
+            src_boxes = all_pred_boxes[0, nm:, :]
+            src_emb = all_hs[0, nm:, :]
+        else:
+            src_logits = all_pred_logits[0]
+            src_boxes = all_pred_boxes[0]
+            src_emb = all_hs[0]
+        det_rows = {
+            'scores': src_logits.sigmoid().max(dim=-1).values.detach(),
+            'logits': src_logits.clone(),
+            'boxes': src_boxes.clone(),
+            'emb': src_emb.clone(),
+        }
+
         if self.use_fsqm:
-            self._fsqm_lifecycle_update()
+            self._fsqm_lifecycle_update(det_rows=det_rows)
         else:
             self.track_base.update(self.track_instances)
 
@@ -533,7 +559,7 @@ class DecoderTracker(nn.Module):
             return [matched_indices, unmatched_track_idxes]
         return [None, None]
 
-    def _fsqm_lifecycle_update(self):
+    def _fsqm_lifecycle_update(self, det_rows=None):
         """
         FSQM online update: manage track lifecycle.
         
@@ -562,47 +588,36 @@ class DecoderTracker(nn.Module):
                 else:
                     track_instances.low_conf_count[i] = 0  # Reset counter
 
-        # --- Track Initiation ---
-        # Find high-confidence detections not yet assigned
-        det_indices = torch.where(
-            (track_instances.obj_idxes.view(-1) == -1) & (track_scores > self.tau_in)
-        )[0]
-
-        for det_idx in det_indices:
-            # Find first inactive slot
-            inactive_slots = torch.where(track_instances.obj_idxes.view(-1) == -1)[0]
-            if len(inactive_slots) == 0:
-                break
-            slot_idx = inactive_slots[0]
-
-            # Skip if det_idx is itself the slot (already inactive)
-            if det_idx == slot_idx:
+        # --- Track Initiation (from the DETECT half) ---
+        #
+        # Previously this read `track_scores` and selected
+        #     (obj_idxes == -1) & (track_scores > tau_in)
+        # -- INACTIVE slots whose own score is high. Termination zeroes a slot's score
+        # and slot-pooling zeroes an unused one, so after the first frame the condition
+        # can never hold, and no track was ever created again: tracks could only be born
+        # on frame 1. New tracks now come from the detect queries above tau_in, which is
+        # what MOTR/models/fsqm.py `inject_new_queries` does, highest confidence first.
+        if det_rows is not None and det_rows['scores'].numel():
+            scores_d = det_rows['scores']
+            cand = torch.where(scores_d > self.tau_in)[0]
+            if cand.numel():
+                cand = cand[scores_d[cand].argsort(descending=True)]
+            for c in cand:
+                inactive_slots = torch.where(track_instances.obj_idxes.view(-1) == -1)[0]
+                if len(inactive_slots) == 0:
+                    break
+                slot_idx = inactive_slots[0]
+                # A detect row is a bare query: it has an embedding but no stored query
+                # position, so its embedding serves as both (both are hidden_dim wide).
+                track_instances.query_pos[slot_idx] = det_rows['emb'][c]
+                track_instances.output_embedding[slot_idx] = det_rows['emb'][c]
+                track_instances.ref_pts[slot_idx] = det_rows['boxes'][c]
+                track_instances.pred_boxes[slot_idx] = det_rows['boxes'][c]
+                track_instances.pred_logits[slot_idx] = det_rows['logits'][c]
+                track_instances.scores[slot_idx] = scores_d[c]
                 track_instances.obj_idxes[slot_idx] = self.max_obj_id
                 self.max_obj_id += 1
-                track_instances.scores[slot_idx] = track_scores[det_idx]
                 track_instances.low_conf_count[slot_idx] = 0
-                continue
-
-            # Move detection to inactive slot
-            track_instances.query_pos[slot_idx] = track_instances.query_pos[det_idx].clone()
-            track_instances.ref_pts[slot_idx] = track_instances.ref_pts[det_idx].clone()
-            track_instances.output_embedding[slot_idx] = track_instances.output_embedding[det_idx].clone()
-            track_instances.pred_boxes[slot_idx] = track_instances.pred_boxes[det_idx].clone()
-            track_instances.pred_logits[slot_idx] = track_instances.pred_logits[det_idx].clone()
-            track_instances.scores[slot_idx] = track_scores[det_idx]
-            track_instances.obj_idxes[slot_idx] = self.max_obj_id
-            self.max_obj_id += 1
-            track_instances.low_conf_count[slot_idx] = 0
-
-            # Clear source slot
-            d = track_instances.query_pos.shape[1]
-            track_instances.query_pos[det_idx] = torch.zeros(d, device=track_instances.query_pos.device)
-            track_instances.ref_pts[det_idx] = torch.zeros(4, device=track_instances.ref_pts.device)
-            track_instances.output_embedding[det_idx] = torch.zeros(
-                track_instances.output_embedding.shape[1], device=track_instances.output_embedding.device)
-            track_instances.obj_idxes[det_idx] = -1
-            track_instances.pred_boxes[det_idx] = torch.zeros(4, device=track_instances.pred_boxes.device)
-            track_instances.scores[det_idx] = 0.0
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
