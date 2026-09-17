@@ -25,9 +25,6 @@ from MOTR.util import box_ops
 
 from torch import Tensor
 from MOTR.util.plot_utils import draw_boxes, draw_ref_pts, image_hwc2chw
-from MOTR.datasets.coco_eval import CocoEvaluator
-from MOTR.datasets.panoptic_eval import PanopticEvaluator
-from MOTR.datasets.data_prefetcher import data_prefetcher, data_dict_to_cuda
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -42,6 +39,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
+    from MOTR.datasets.data_prefetcher import data_prefetcher
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
@@ -102,6 +100,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for data_dict in metric_logger.log_every(data_loader, print_freq, header):
+        from MOTR.datasets.data_prefetcher import data_dict_to_cuda
         data_dict = data_dict_to_cuda(data_dict, device)
         outputs = model(data_dict)
 
@@ -156,6 +155,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     header = 'Test:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
+    from MOTR.datasets.coco_eval import CocoEvaluator
+    from MOTR.datasets.panoptic_eval import PanopticEvaluator
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 

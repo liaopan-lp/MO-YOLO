@@ -68,6 +68,29 @@ Install other dependencies:
 pip install -r requirements.txt
 ```
 
+### Build the Multi-Scale Deformable Attention extension (required)
+
+This step is **not optional**. `MOTR/models/__init__.py` imports the MOTR baseline, which
+imports `MOTR.models.deformable_transformer`, which ends in `import
+MultiScaleDeformableAttention`. A plain `from ultralytics import DecoderTracker` therefore
+fails with `ModuleNotFoundError: No module named 'MultiScaleDeformableAttention'` until the
+extension is compiled and importable from the repository root.
+
+With the CUDA toolkit on `PATH` (`nvcc` must match the PyTorch CUDA build):
+
+```bash
+cd MOTR/models/ops
+python setup.py build_ext --inplace
+cp MultiScaleDeformableAttention*.so ../../../   # importable from the repo root
+cd ../../..
+```
+
+Verify:
+
+```bash
+python -c "import MultiScaleDeformableAttention"
+```
+
 Key dependencies include:
 - `torch >= 2.0`
 - `torchvision >= 0.15`
