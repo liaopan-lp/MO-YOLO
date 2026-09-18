@@ -472,8 +472,13 @@ class MOTRLoss(nn.Module):
                 loss_cls = self.vfl(pred_scores, gt_scores, one_hot)
             else:
                 loss_cls = self.fl(pred_scores, one_hot.float())
-            # loss_cls /= max(num_gts, 1) / nq
-            loss_cls = loss_cls * nq  # 这里改了
+            # Per-GT normalisation, as in the reference (CO-MOT losses.py:87 divides by
+            # num_boxes). VFL returns (...).mean(1).sum() == total/nq, so
+            #     (total/nq) * nq / max(num_gts,1) == total / max(num_gts,1)
+            # which is the reference's form. The upstream edit `loss_cls * nq` dropped
+            # the divisor, leaving a raw sum over nq=300 queries while bbox/giou stay
+            # sums over num_gts terms -- overweighting classification by ~nq/num_gts.
+            loss_cls = loss_cls * nq / max(num_gts, 1)
 
         else:
             loss_cls = nn.BCEWithLogitsLoss(reduction='none')(pred_scores, gt_scores).mean(1).sum()  # YOLO CLS loss
@@ -493,10 +498,13 @@ class MOTRLoss(nn.Module):
 
         # loss[name_bbox] = self.loss_gain['bbox'] * F.l1_loss(pred_bboxes, gt_bboxes, reduction='sum') / len(
         #     gt_bboxes)  # 这里改了
-        loss[name_bbox] = self.loss_gain['bbox'] * F.l1_loss(pred_bboxes, gt_bboxes, reduction='sum')
+        # Divided by the number of matched pairs, matching the giou/class terms below.
+        # `len(gt_bboxes)` is >= 1 here: the function returns early when it is 0.
+        loss[name_bbox] = self.loss_gain['bbox'] * F.l1_loss(
+            pred_bboxes, gt_bboxes, reduction='sum') / max(len(gt_bboxes), 1)
         loss[name_giou] = 1.0 - bbox_iou(pred_bboxes, gt_bboxes, xywh=True, GIoU=True)
         # loss[name_giou] = loss[name_giou].sum() / len(gt_bboxes)  # 这里改了
-        loss[name_giou] = loss[name_giou].sum()
+        loss[name_giou] = loss[name_giou].sum() / max(len(gt_bboxes), 1)
         loss[name_giou] = self.loss_gain['giou'] * loss[name_giou]
         loss = {k: v.squeeze() for k, v in loss.items()}
         return loss
@@ -652,7 +660,20 @@ class MOTRLoss(nn.Module):
 
         gt_scores = torch.zeros([bs, nq], device=pred_scores.device)
         if len(gt_bboxes):
-            gt_scores[idx] = bbox_iou(pred_bboxes.detach(), gt_bboxes, xywh=True).squeeze(-1)
+            # A matched query's classification target is a HARD 1.0, as in both
+            # references (CO-MOT motr_co.py:167-175, MOTR motr.py:156-165, which feed
+            # a one-hot target to sigmoid_focal_loss).
+            #
+            # This used to be `bbox_iou(pred_bboxes.detach(), gt_bboxes, ...)`, i.e. the
+            # pair's IoU. VarifocalLoss (loss.py:24) uses gt_score as BOTH the BCE target
+            # and, for positives, the loss weight:
+            #     weight = alpha * p**gamma * (1 - label) + gt_score * label
+            # so an IoU target caps a matched query's confidence at its own box IoU and
+            # scales its upward gradient by that same IoU. The FSQM initiation threshold
+            # (tau_in = 0.5, head.py:144) reads that confidence, so while boxes are still
+            # poor (IoU < 0.5 early in training) no track can EVER initiate. The
+            # reference has no such coupling between localisation quality and confidence.
+            gt_scores[idx] = 1.0
 
         loss = {}
         loss.update(self._get_loss_class(pred_scores, targets, gt_scores, len(gt_bboxes), postfix))
@@ -688,27 +709,20 @@ class MOTRLoss(nn.Module):
                                                      match_indices=match_indices)
 
         if self.aux_loss:
-            if unmatched_track_idxes is None:
-                total_loss.update(
-                    self._get_loss_aux(pred_bboxes[:-1], pred_scores[:-1], gt_bboxes, gt_cls, gt_groups, None,
-                                       postfix))
-            else:
-
-                unmatched_mask = torch.isin(torch.arange(pred_bboxes.shape[2], device=pred_bboxes.device),
-                                            unmatched_track_idxes)
-                # 使用 unmatched_track_idxes 对 pred_bboxes 和 pred_scores 进行筛选
-                unmatched_pred_bboxes = pred_bboxes[:, :, unmatched_mask, :]
-                unmatched_pred_scores = pred_scores[:, :, unmatched_mask, :]
-
-                # 保留匹配和未匹配的部分
-                matched_pred_bboxes = pred_bboxes[:, :, ~unmatched_mask, :]
-                matched_pred_scores = pred_scores[:, :, ~unmatched_mask, :]
-
-                # 在计算损失之前使用筛选后的结果
-                total_loss.update(
-                    self._get_loss_aux(unmatched_pred_bboxes[:-1], unmatched_pred_scores[:-1], gt_bboxes, gt_cls,
-                                       gt_groups, None, postfix)
-                )
+            # The auxiliary layers are computed over the FULL query set, so that slots
+            # already matched to an active track are supervised at every intermediate
+            # decoder layer too. The reference does the same: CO-MOT
+            # motr_co.py:335-339 concatenates `new_matched_indices_layer` with
+            # `prev_matched_indices` before computing the aux loss.
+            #
+            # This used to slice the inputs to `unmatched_pred_bboxes` (the inactive
+            # slots) and pass only that subset. The `matched_pred_bboxes` /
+            # `matched_pred_scores` it computed alongside -- under a comment reading
+            # "保留匹配和未匹配的部分", i.e. keep both halves -- were never used, so a
+            # tracked object received no auxiliary-layer gradient at all.
+            total_loss.update(
+                self._get_loss_aux(pred_bboxes[:-1], pred_scores[:-1], gt_bboxes, gt_cls, gt_groups, None,
+                                   postfix))
 
         return [total_loss, num_trackobject]
 
