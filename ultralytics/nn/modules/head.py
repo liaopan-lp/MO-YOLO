@@ -123,6 +123,40 @@ class DecoderTracker(nn.Module):
         self.nq = nq
         self.decoder = MYDecoder(nc=nc, ch=ch, nq=self.nq)
 
+        # Learned per-slot embeddings for the fixed-size empty-track pool.
+        #
+        # The fork used torch.zeros for the pool's ref_pts/query_pos, and qim.py then
+        # re-zeroed them every frame. That made all nq inactive slots BIT-IDENTICAL at
+        # the decoder input: the residual content embedding they receive is built from a
+        # per-image scalar argmax (`clses[i] = cls.item()`, broadcast across every slot)
+        # through `denoising_class_embed`, which is nn.Embedding(nc=1, hd) -- a single
+        # row. Those same identical slots are the ONLY population eligible for
+        # new-object (newborn) matching, so the matcher was always choosing among
+        # identical, unlocalizable queries, and nothing ever cleared tau_in.
+        #
+        # The reference gives every slot its own learned embedding instead
+        # (CO-MOT _generate_empty_tracks, motr_co.py:565-572):
+        #     ref_pts   = position.weight + position_offset.weight
+        #     query_pos = query_embed.weight + query_embed_offset.weight
+        # and its QIM (models/qim.py:256-302) never zeroes anything -- rows not selected
+        # are simply replaced next frame by freshly generated ones.
+        #
+        # MYDecoder is constructed with learnt_init_query=False (see head.py:124), so
+        # `self.tgt_embed` does not exist and there is no per-slot embedding to reuse.
+        # Hence these are the fork's own per-slot parameters. Sizes and initialisation
+        # mirror the reference: ref_pts uniform(0, 1) plus a ~1e-5 offset, query_pos on
+        # nn.Embedding's default N(0, 1) plus a ~1e-5 offset.
+        hd = self.decoder.hidden_dim
+        self.empty_ref_pts = nn.Embedding(nq, 4)
+        self.empty_ref_pts_offset = nn.Embedding(nq, 4)
+        self.empty_query_pos = nn.Embedding(nq, hd)
+        self.empty_query_pos_offset = nn.Embedding(nq, hd)
+        nn.init.uniform_(self.empty_ref_pts.weight, 0, 1)
+        nn.init.normal_(self.empty_ref_pts_offset.weight, 0, 10e-6)
+        nn.init.normal_(self.empty_query_pos_offset.weight, 0, 10e-6)
+        # empty_query_pos keeps nn.Embedding's default N(0, 1), exactly like the
+        # reference's query_embed, which is never re-initialised either.
+
         self.is_first = True
 
         self.track_embed = build_query_interaction_layer(args, args.query_interaction_layer, d_model,
@@ -131,7 +165,13 @@ class DecoderTracker(nn.Module):
 
         self.track_base = RuntimeTrackerBase(training=self.training)
         if self.training:
-            self.matcher = HungarianMatcherGroup()  #
+            # Same weights as the reference matcher (CO-MOT main.py:160 --set_cost_class 2,
+            # bbox 5, giou 2, wired in at CO-MOT/models/matcher.py:651; MOTR/main.py:111 is
+            # the same). The bare default at utils/ops.py:902 is class 1, which NO
+            # reference ever uses -- and the fork's own loss matcher already disagrees
+            # with it (utils/loss.py:450: class 2, bbox 5, giou 2). This matcher's indices
+            # BECOME the loss targets and the track IDs.
+            self.matcher = HungarianMatcherGroup(cost_gain={'class': 2, 'bbox': 5, 'giou': 2})
         else:
             self.matcher = None
 
@@ -193,9 +233,18 @@ class DecoderTracker(nn.Module):
         num_queries, dim = self.decoder.num_queries, self.decoder.hidden_dim * 2
         device, dtype = self._state_device_dtype()
 
-        # Fixed-size memory pool: N_m queries, all initialized to zero
-        track_instances.ref_pts = torch.zeros(num_queries, 4, device=device, dtype=dtype)
-        track_instances.query_pos = torch.zeros((num_queries, 256), dtype=dtype, device=device)
+        # Fixed-size memory pool: N_m queries, each with its OWN learned embedding.
+        #
+        # Not torch.zeros: identical rows are unidentifiable, and these rows are the only
+        # newborn-matching candidates (see the long comment in __init__ above).
+        track_instances.ref_pts = (self.empty_ref_pts.weight + self.empty_ref_pts_offset.weight).to(
+            device=device, dtype=dtype)
+        track_instances.query_pos = (self.empty_query_pos.weight + self.empty_query_pos_offset.weight).to(
+            device=device, dtype=dtype)
+        # output_embedding stays zero for empty tracks -- that is what the reference does
+        # at generation time (CO-MOT motr_co.py:574) and what a slot with no decoded
+        # history should carry. It is NOT a decoder input (the decoder is fed embeddings /
+        # refer_bbox / query_pos), so keeping it zero does not re-introduce the degeneracy.
         track_instances.output_embedding = torch.zeros((num_queries, dim >> 1), device=device, dtype=dtype)
         
         # Global ID pool: all inactive (-1)
@@ -426,6 +475,24 @@ class DecoderTracker(nn.Module):
         # 21078 gt objects. The track half is supervised, so its scores mean something.
         _fresh_scores = track_scores.clone()
 
+        # Same aliasing, same fix, for what the matcher reads.
+        #
+        # The termination pass below zeroes a terminated slot's pred_boxes IN PLACE
+        # (_fsqm_lifecycle_update, head.py:642). That slot's obj_idxes becomes -1 in the
+        # same pass, so it lands in
+        # `unmatched_track_idxes` further down and is handed straight to the newborn
+        # matcher with an all-zero box. (pred_logits is NOT zeroed, but snapshot it too:
+        # both are matcher inputs and the snapshot is by definition what the slot really
+        # predicted this frame.)
+        #
+        # Calibrated severity: the zeroed box is the HIGHEST-cost row in the matcher
+        # (L1 gain 5: ~7.0 vs ~1-2 for an imperfect real box; degenerate-box GIoU gives
+        # cost_giou 2.0 vs ~1.0), so it cannot outbid a plausible real candidate and is
+        # only ever a forced last-resort match. The harm is narrow but real: for that
+        # slot the loss pairing is decided by a box that is not the box being trained.
+        _fresh_pred_boxes = self.track_instances.pred_boxes.clone()    # (N_m, 4)
+        _fresh_pred_logits = self.track_instances.pred_logits.clone()  # (N_m, nc)
+
         if self.use_fsqm:
             self._fsqm_lifecycle_update(fresh_scores=_fresh_scores)
         else:
@@ -500,8 +567,8 @@ class DecoderTracker(nn.Module):
                     _, _, tbsp_keep_mask = self._tbsp_filter(
                         track_pred_boxes=pred_boxes_i,
                         track_pred_logits=pred_logits_i,
-                        det_pred_boxes=self.track_instances.pred_boxes[unmatched_track_idxes],
-                        det_pred_logits=self.track_instances.pred_logits[unmatched_track_idxes]
+                        det_pred_boxes=_fresh_pred_boxes[unmatched_track_idxes],
+                        det_pred_logits=_fresh_pred_logits[unmatched_track_idxes]
                     )
                     # Only keep detect queries that passed TBSP filtering
                     unmatched_track_idxes = unmatched_track_idxes[tbsp_keep_mask]
@@ -509,8 +576,10 @@ class DecoderTracker(nn.Module):
                 # Match unmatched detections with unmatched GT
                 if len(unmatched_track_idxes) > 0 and len(untracked_tgt_indexes) > 0:
                     unmatched_outputs = {
-                        'pred_logits': self.track_instances.pred_logits[unmatched_track_idxes].unsqueeze(0),
-                        'pred_boxes': self.track_instances.pred_boxes[unmatched_track_idxes].unsqueeze(0),
+                        # Snapshot, not the live state: the termination pass has already
+                        # zeroed pred_boxes for any slot it terminated this frame.
+                        'pred_logits': _fresh_pred_logits[unmatched_track_idxes].unsqueeze(0),
+                        'pred_boxes': _fresh_pred_boxes[unmatched_track_idxes].unsqueeze(0),
                     }
 
                     new_track_indices = self.matcher(unmatched_outputs["pred_boxes"], unmatched_outputs["pred_logits"],

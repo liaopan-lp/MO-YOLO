@@ -457,6 +457,67 @@ class MOTRLoss(nn.Module):
         self.uni_match_ind = uni_match_ind
         self.device = None
 
+        # ------------------------------------------------------------------
+        # How many decoder rows can ever be matched to a ground truth
+        # ------------------------------------------------------------------
+        # The head's matcher only ever looks at the FIRST `self.nq` rows of the decoder
+        # output ("track" slots: head.py:396-398 `nm = self.nq` /
+        # `all_pred_logits[:, :nm, :]`, used at :447 and :516). On a non-first frame the
+        # head appends a second block of the same width -- encoder top-k proposals --
+        # and the decoder therefore emits 2*nq rows (head.py:1130-1141). Measured on this
+        # fork: 0 of 20285 matched source indices ever reached index >= nq.
+        #
+        # So the trailing nq rows of the tensor the criterion is handed can never hold a
+        # positive. Their one-hot target is the background class not because they were
+        # judged background but because nothing ever looked at them, and every frame
+        # they add a constant nq of negative mass to the shared classification head
+        # (the box/giou terms only ever touch matched pairs, so those rows get no
+        # localisation gradient at all -- they are anti-trained as background, not
+        # merely untrained). Excluding them from the classification term is therefore
+        # not "removing supervision", it is removing a mislabelled negative.
+        #
+        # `num_track_queries` is that boundary. A caller that knows it -- the head owns
+        # `self.nq` and already returns it (head.py:341 `return x, self.track_instances,
+        # self.nq, match_indices`) -- should pass it to `forward()`; when nothing does,
+        # `_matchable_queries` recovers it from the widths it is shown. See there.
+        self.num_track_queries = None
+
+    def _matchable_queries(self, n_rows, postfix=''):
+        """Number of leading decoder rows that can hold a positive target.
+
+        Args:
+            n_rows (int): width of the decoder output the criterion was handed.
+            postfix (str): loss-name postfix; '_dn' marks the denoising branch.
+
+        Returns:
+            (int): rows to supervise in the classification term (<= n_rows).
+
+        The denoising branch is never truncated at all (its own pairing covers every row
+        of the group). For the main branch the width comes from `num_track_queries`,
+        supplied by the caller that owns the fact -- `tasks.py:438` passes the head's own
+        `self.model[-1].nq`. The head emits
+
+            nq                             rows when there is no track block
+                                           (first frame / empty pool, head.py:1130-1131)
+            nq (track) + nq (encoder top-k) rows otherwise
+
+        and only the first nq are ever offered to a matcher, so the rows past them can
+        never hold a positive.
+        """
+        if postfix:
+            # Denoising groups: the pairing given to the branch covers every row of the
+            # group (its negatives are supposed to be background), so no row is
+            # never-matchable here and nothing may be dropped -- not even when a caller
+            # has pinned `num_track_queries` to the main branch's much smaller pool.
+            return n_rows
+        if self.num_track_queries is None:
+            # No caller supplied the pool width, so nothing may be excluded: supervising
+            # the whole width is the pre-existing behaviour, and over-broad supervision is
+            # never WRONG, only wasteful. `tasks.py:438` supplies it from the head
+            # (`self.model[-1].nq`), so this is the degraded path, not the normal one.
+            return n_rows
+        return min(n_rows, self.num_track_queries)
+
     def _get_loss_class(self, pred_scores, targets, gt_scores, num_gts, postfix=''):
         # logits: [b, query, num_classes], gt_class: list[[n, 1]]
         name_class = f'loss_class{postfix}'
@@ -551,14 +612,31 @@ class MOTRLoss(nn.Module):
         """Get auxiliary losses"""
         # NOTE: loss class, bbox, giou, mask, dice
         loss = torch.zeros(5 if masks is not None else 3, device=pred_bboxes.device)
-        # if match_indices is None and self.use_uni_match:
-        #     match_indices = self.matcher(pred_bboxes[self.uni_match_ind],
-        #                                  pred_scores[self.uni_match_ind],
-        #                                  gt_bboxes,
-        #                                  gt_cls,
-        #                                  gt_groups,
-        #                                  masks=masks[self.uni_match_ind] if masks is not None else None,
-        #                                  gt_mask=gt_mask)
+        # HONOUR a caller-supplied assignment; only re-match when there is none.
+        #
+        # This parameter used to be dead: the body re-matched inside the loop below
+        # unconditionally, so a pairing handed in from outside was silently thrown away
+        # and replaced by a fresh Hungarian assignment for every layer. That is what the
+        # pristine DETRLoss this file was copied from does NOT do --
+        # models/utils/loss.py:130 `if match_indices is None and self.use_uni_match:` and
+        # :148 `match_indices=match_indices` -- and it is what the denoising branch is
+        # built to rely on: DecoderTrackingLoss.forward derives the pairing from
+        # `dn_pos_idx` (i.e. "this noisy query came from GT k") and hands it to
+        # MOTRLoss.forward, which forwards it here for the '_dn' branch. A re-match
+        # recovers that source GT for most noisy queries -- a Hungarian assignment
+        # usually picks the nearest GT, which is where the noise came from -- but for a
+        # query whose LABEL/BOX noise moved it closest to a DIFFERENT ground truth it
+        # silently teaches the wrong class, and the measured effect of supplying a bogus
+        # pairing used to be no change at all in the aux output plus a wasted matcher
+        # call per layer.
+        if match_indices is None and self.use_uni_match:
+            match_indices = self.matcher(pred_bboxes[self.uni_match_ind],
+                                         pred_scores[self.uni_match_ind],
+                                         gt_bboxes,
+                                         gt_cls,
+                                         gt_groups,
+                                         masks=masks[self.uni_match_ind] if masks is not None else None,
+                                         gt_mask=gt_mask)
         for i, (aux_bboxes, aux_scores) in enumerate(zip(pred_bboxes, pred_scores)):
             # A layer with no queries contributes nothing, but the matcher reshapes its
             # cost matrix with `C.view(bs, nq, -1)` and nq == 0 makes that ambiguous, so
@@ -567,13 +645,6 @@ class MOTRLoss(nn.Module):
             if aux_scores.shape[-2] == 0:
                 continue
             aux_masks = masks[i] if masks is not None else None
-            match_indices = self.matcher(aux_bboxes,
-                                         aux_scores,
-                                         gt_bboxes,
-                                         gt_cls,
-                                         gt_groups,
-                                         masks=aux_masks,
-                                         gt_mask=gt_mask)
             loss_, num_object = self._get_loss(aux_bboxes,
                                                aux_scores,
                                                gt_bboxes,
@@ -625,7 +696,8 @@ class MOTRLoss(nn.Module):
                   masks=None,
                   gt_mask=None,
                   postfix='',
-                  match_indices=None):
+                  match_indices=None,
+                  num_track_queries=None):
         """Get losses"""
         if match_indices is None:
             match_indices = self.matcher(pred_bboxes,
@@ -676,7 +748,26 @@ class MOTRLoss(nn.Module):
             gt_scores[idx] = 1.0
 
         loss = {}
-        loss.update(self._get_loss_class(pred_scores, targets, gt_scores, len(gt_bboxes), postfix))
+        # Rows at index >= num_track_queries were never offered to a matcher
+        # (`num_track_queries` is None -> the whole width is matchable, which is the
+        # plain DETR/RT-DETR case). They are dropped from the classification term only;
+        # the box/giou terms are built from the matched pairs above and are untouched.
+        #
+        # Slicing -- rather than zero-weighting -- also keeps the normalisation honest:
+        # `_get_loss_class` recovers `nq` from the tensor it is given and converts
+        # FocalLoss's `mean(1).sum()` (= total/nq) back into a raw sum with `* nq`, so
+        # the surviving rows are still divided by max(num_gts, 1), exactly as the
+        # reference divides by num_boxes (CO-MOT losses.py:87).
+        n_cls = nq if num_track_queries is None else min(nq, num_track_queries)
+        if n_cls < nq and idx[1].numel():
+            # The pairing itself is evidence about the boundary: if it reaches past it,
+            # the boundary is wrong (a caller passed a smaller `num_track_queries` than
+            # the head actually matches, or the head now matches further) and every row
+            # it names must stay supervised. This makes the truncation unable to deny a
+            # positive by construction.
+            n_cls = max(n_cls, int(idx[1].max()) + 1)
+        loss.update(self._get_loss_class(pred_scores[:, :n_cls], targets[:, :n_cls], gt_scores[:, :n_cls],
+                                         len(gt_bboxes), postfix))
         loss.update(self._get_loss_bbox(pred_bboxes, gt_bboxes, postfix))
         # if masks is not None and gt_mask is not None:
         #     loss.update(self._get_loss_mask(masks, gt_mask, match_indices, postfix))
@@ -684,7 +775,8 @@ class MOTRLoss(nn.Module):
 
         return [loss, len(gt_bboxes)]
 
-    def forward(self, pred_bboxes, pred_scores, batch, match_indices, unmatched_track_idxes=None, postfix='', **kwargs):
+    def forward(self, pred_bboxes, pred_scores, batch, match_indices, unmatched_track_idxes=None, postfix='',
+                num_track_queries=None, **kwargs):
         """
         Args:
             pred_bboxes (torch.Tensor): [l, b, query, 4]
@@ -696,17 +788,24 @@ class MOTRLoss(nn.Module):
             match_indices (list) :[torch.Tensor,torch.Tensor]
             unmatched_track_idxes (torch.Tensor) :[]
             postfix (str): postfix of loss name.
+            num_track_queries (int, optional): width of the head's matchable pool; see
+                `_matchable_queries`. Omit to let the loss recover it.
         """
         self.device = pred_bboxes.device
         # match_indices = kwargs.get('match_indices', None)
         gt_cls, gt_bboxes, gt_groups = batch['cls'], batch['bboxes'], batch['gt_groups']
+        if num_track_queries is not None and postfix == '':
+            # An explicit value is authoritative for every later call as well.
+            self.num_track_queries = num_track_queries
         total_loss, num_trackobject = self._get_loss(pred_bboxes[-1],
                                                      pred_scores[-1],
                                                      gt_bboxes,
                                                      gt_cls,
                                                      gt_groups,
                                                      postfix=postfix,
-                                                     match_indices=match_indices)
+                                                     match_indices=match_indices,
+                                                     num_track_queries=self._matchable_queries(
+                                                         pred_scores[-1].shape[1], postfix))
 
         if self.aux_loss:
             # The auxiliary layers are computed over the FULL query set, so that slots
@@ -720,9 +819,23 @@ class MOTRLoss(nn.Module):
             # `matched_pred_scores` it computed alongside -- under a comment reading
             # "保留匹配和未匹配的部分", i.e. keep both halves -- were never used, so a
             # tracked object received no auxiliary-layer gradient at all.
+            # A caller-supplied pairing is forwarded (the pristine DETRLoss does the
+            # same at models/utils/loss.py:244). The denoising branch is the one that
+            # has such a pairing -- `dn_pos_idx`-derived, and every auxiliary layer must
+            # keep it -- so it is forwarded there.
+            #
+            # The main branch deliberately keeps passing None: what arrives in its
+            # `match_indices` is the HEAD's track-identity pairing, not an assignment,
+            # and it only covers slots that already found a GT. Using it layer-wide
+            # would leave every leftover ground truth with no positive at the auxiliary
+            # layers, where CO-MOT re-matches precisely so that newborns get one
+            # ("此处匹配时对新生儿时重新算对应关系的，不直接使用最后一层box输出的对应关系",
+            # motr_co.py:328-339). Re-matching per layer is this branch's existing,
+            # reference-consistent behaviour.
+            aux_match_indices = match_indices if postfix else None
             total_loss.update(
-                self._get_loss_aux(pred_bboxes[:-1], pred_scores[:-1], gt_bboxes, gt_cls, gt_groups, None,
-                                   postfix))
+                self._get_loss_aux(pred_bboxes[:-1], pred_scores[:-1], gt_bboxes, gt_cls, gt_groups,
+                                   aux_match_indices, postfix))
 
         return [total_loss, num_trackobject]
 
@@ -730,10 +843,11 @@ class MOTRLoss(nn.Module):
 class DecoderTrackingLoss(MOTRLoss):
 
     def forward(self, preds, batch, dn_bboxes=None, dn_scores=None, dn_meta=None, match_indices=None,
-                unmatched_track_idxes=None):
+                unmatched_track_idxes=None, num_track_queries=None):
         pred_bboxes, pred_scores = preds
         total_loss, num_trackobject = super().forward(pred_bboxes, pred_scores, batch, match_indices,
-                                                      unmatched_track_idxes)
+                                                      unmatched_track_idxes,
+                                                      num_track_queries=num_track_queries)
 
         if dn_meta is not None:
             dn_pos_idx, dn_num_group = dn_meta['dn_pos_idx'], dn_meta['dn_num_group']

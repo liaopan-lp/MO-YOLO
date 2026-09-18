@@ -431,13 +431,19 @@ class TrackingModel(DetectionModel):
             # unmatched_track_idxes = full_track_idxes[track_instances.obj_idxes[:, 0] == -1]  # 获取检测query
             # print(22222222222,unmatched_track_idxes)
 
+            # The head matches only its first `nq` decoder rows; everything past them
+            # (the encoder top-k proposals appended on non-first frames) can never hold
+            # a positive. `self.model[-1]` is the DecoderTracker head, so `nq` is the
+            # pool width -- state the boundary here, where it is known, rather than
+            # letting the loss reconstruct it from the widths it happens to be shown.
             loss1, num_object = self.criterion((dec_bboxes_, dec_scores_),
                                                targets,
                                                dn_bboxes=dn_bboxes,
                                                dn_scores=dn_scores,
                                                dn_meta=dn_meta,
                                                match_indices=match_indices,
-                                               unmatched_track_idxes=unmatched_track_idxes)
+                                               unmatched_track_idxes=unmatched_track_idxes,
+                                               num_track_queries=self.model[-1].nq)
             # loss2, num_object = self.criterion((dec_bboxes_, dec_scores_),
             #                                    targets,
             #                                    dn_bboxes=dn_bboxes,

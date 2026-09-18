@@ -297,7 +297,24 @@ class QueryInteractionModule(QueryInteractionBase):
         query_feat = self.norm_feat(query_feat)
         track_instances.query_pos = query_feat
 
-        track_instances.ref_pts = inverse_sigmoid(track_instances.pred_boxes[:, :4].detach().clone())
+        # Only a slot that actually holds a live track may derive its reference point
+        # from its decoded box. Writing it for EVERY row collapsed all inactive slots
+        # onto one constant: an inactive slot's pred_boxes are zeros, so
+        # inverse_sigmoid(0) is the same value for all of them, and ref_pts feeds the
+        # decoder's positional embedding (pos2posemb -> MYDecoder._get_decoder_input),
+        # so an identical ref_pts means an identical positional input. That is the same
+        # degeneracy this module no longer re-creates for query_pos; leaving this line
+        # unfixed would let the learned per-slot empty-track ref_pts survive one frame.
+        #
+        # The reference updates only its positive rows: CO-MOT models/qim.py:273-302,
+        # `ref_pts[is_pos] = pred_boxes[is_pos]` with `is_pos = scores > score_thr`.
+        # Here FSQM's initiation/termination lives in the head, so the slot's id -- not
+        # its transient score -- is what says it holds a real track.
+        active = track_instances.obj_idxes.view(-1) >= 0
+        if active.any():
+            ref_pts = track_instances.ref_pts.clone()
+            ref_pts[active] = inverse_sigmoid(track_instances.pred_boxes[active, :4].detach().clone())
+            track_instances.ref_pts = ref_pts
         return track_instances
 
     def forward(self, data) -> Instances:
@@ -306,25 +323,29 @@ class QueryInteractionModule(QueryInteractionBase):
         
         FSQM lifecycle management (initiation/termination) is handled externally in DecoderTracker.
         This module only updates track embeddings (query_pos, ref_pts) for the fixed-size pool.
-        
-        For inactive queries (ID=-1), zero inputs are preserved through all layers
-        (linear, norm, dropout, GELU, self-attention with zero Q/K/V all produce zero output).
-        After update, inactive queries are explicitly re-zeroed for safety.
+
+        Inactive slots (ID=-1) are NOT re-zeroed. The reference QIM never zeroes anything
+        (CO-MOT/models/qim.py:256-302, class GQIM): a row that is not selected is simply
+        replaced next frame by a fresh _generate_empty_tracks row, which carries its own
+        learned per-slot embedding. Re-zeroing here instead flattened every inactive slot to
+        the same value on every frame, and those identical slots are the only newborn
+        matching candidates.
+
+        output_embedding IS still held at zero for inactive slots: that is the empty-track
+        value the reference generates with (CO-MOT motr_co.py:574), it is what a slot with no
+        decoded history should carry, and output_embedding is not a decoder input -- it is
+        only ever read by this QIM's self-attention as `tgt`/`value`. Keeping it zero
+        therefore does not re-create the degeneracy that query_pos/ref_pts caused.
         """
         track_queries = data['track_queries']
-        
+
         # Update track embeddings for the full fixed-size pool
         updated_queries = self._update_track_embedding(track_queries)
-        
-        # Re-zero inactive queries to ensure they remain zero after QIM processing
-        # This handles edge cases where floating point operations might introduce small values
+
         inactive_mask = (updated_queries.obj_idxes.view(-1) == -1)
         if inactive_mask.any():
-            d = updated_queries.query_pos.shape[1]
-            updated_queries.query_pos[inactive_mask] = 0.0
-            updated_queries.ref_pts[inactive_mask] = 0.0
             updated_queries.output_embedding[inactive_mask] = 0.0
-        
+
         return updated_queries
 
 
