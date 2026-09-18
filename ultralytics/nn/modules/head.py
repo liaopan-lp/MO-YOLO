@@ -243,8 +243,14 @@ class DecoderTracker(nn.Module):
             device=device, dtype=dtype)
         # output_embedding stays zero for empty tracks -- that is what the reference does
         # at generation time (CO-MOT motr_co.py:574) and what a slot with no decoded
-        # history should carry. It is NOT a decoder input (the decoder is fed embeddings /
-        # refer_bbox / query_pos), so keeping it zero does not re-introduce the degeneracy.
+        # history should carry.
+        #
+        # It IS now a decoder input for the track block: head.py forwards it as
+        # `track_content` and MYDecoder prefers it over the constant class embedding.
+        # Zeroing it for inactive slots does not re-create the degeneracy this block was
+        # added to remove, because a newborn's identity is carried by ref_pts/query_pos,
+        # which are per-slot learned embeddings above and stay distinct; the reference
+        # keeps the content half zero for the same slots (MOTR motr.py:460).
         track_instances.output_embedding = torch.zeros((num_queries, dim >> 1), device=device, dtype=dtype)
         
         # Global ID pool: all inactive (-1)
@@ -360,6 +366,7 @@ class DecoderTracker(nn.Module):
             ref_pts = None
             pre_class = None
             track_query_pos = None
+            track_content = None
             # No masking needed for first frame (all tracks inactive)
             attn_mask = None
         else:
@@ -367,10 +374,16 @@ class DecoderTracker(nn.Module):
             ref_pts = self.track_instances.ref_pts
             pre_class = self.track_instances.pred_logits
             track_query_pos = self.track_instances.query_pos
+            # Each slot's own decoded content, refreshed from the previous frame's
+            # decoder output (head.py:461) and fed back as the track block's content
+            # input. Without it that input is one constant vector shared by all 300
+            # slots and every frame, which leaves ref_pts as the only per-slot signal.
+            track_content = self.track_instances.output_embedding
             if len(self.track_instances) <= 0:
                 ref_pts = None
                 pre_class = None
                 track_query_pos = None
+                track_content = None
             # Generate attention mask based on track IDs (only when FSQM is enabled)
             attn_mask = self._generate_attn_mask() if self.use_fsqm else None
 
@@ -381,6 +394,7 @@ class DecoderTracker(nn.Module):
                                              batch=batch,
                                              is_first=self.is_first,
                                              pre_class=pre_class,
+                                             track_content=track_content,
                                              attn_mask=attn_mask)
 
         x = dec_bboxes, dec_scores, enc_bbox, enc_outputs_class, dn_meta, init_reference, dec_output_embeding
@@ -1035,7 +1049,7 @@ class MYDecoder(nn.Module):
         self._reset_parameters()
 
     def forward(self, x, track_ref_pts=None, batch=None, is_first=False, pre_class=None, track_query_pos=None,
-                attn_mask=None):
+                attn_mask=None, track_content=None):
         from ultralytics.models.utils.ops import get_track_cdn_group
 
         # input projection and embedding
@@ -1057,6 +1071,17 @@ class MYDecoder(nn.Module):
             track_cls_embed = self.denoising_class_embed.weight[clses]  # bs*num * 2 * num_group, 256
 
             track_cls_embed = track_cls_embed.unsqueeze(dim=0)
+            # `clses` holds an argmax over the class axis, so with nc=1 (the MOT config)
+            # every entry is 0 and the line above yields ONE vector tiled across all 300
+            # track slots -- and the same vector on every frame. The per-slot content the
+            # tracking path needs already exists as `output_embedding` (refreshed from the
+            # decoder output at head.py:461, per-slot, and 300 distinct rows for live
+            # tracks); it was simply never fed here. Take it when the caller supplies it,
+            # which mirrors the reference carrying the content half of its track query
+            # (MOTR motr.py:459-460, deformable_transformer_plus.py:328).
+            if track_content is not None:
+                track_cls_embed = track_content.unsqueeze(dim=0).to(
+                    device=track_cls_embed.device, dtype=track_cls_embed.dtype)
             num_track_queries = track_cls_embed.shape[1]
 
         else:
