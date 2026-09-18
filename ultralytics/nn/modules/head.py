@@ -412,8 +412,22 @@ class DecoderTracker(nn.Module):
         self.track_instances.output_embedding = track_hs[0].clone()      # (N_m, d)
 
         # Lifecycle management: FSQM or default tracker
+        # Capture the FRESH per-frame scores before the lifecycle can zero them.
+        #
+        # The termination pass overwrites a terminated slot's score with 0.0 in place,
+        # and `track_instances.scores` IS that same tensor. Initiation therefore could
+        # not tell which inactive slots carry a confident prediction, and no track was
+        # ever created after the first frame.
+        #
+        # The track half is used, not the detect half: measured over one epoch, the
+        # detect rows are never a positive target (0 of 20285 matched source indices
+        # reached index >= 300), so their scores are trained only as background and
+        # carry no object signal. Spawning from them produced 218162 predictions for
+        # 21078 gt objects. The track half is supervised, so its scores mean something.
+        _fresh_scores = track_scores.clone()
+
         if self.use_fsqm:
-            self._fsqm_lifecycle_update()
+            self._fsqm_lifecycle_update(fresh_scores=_fresh_scores)
         else:
             self.track_base.update(self.track_instances)
 
@@ -533,7 +547,7 @@ class DecoderTracker(nn.Module):
             return [matched_indices, unmatched_track_idxes]
         return [None, None]
 
-    def _fsqm_lifecycle_update(self):
+    def _fsqm_lifecycle_update(self, fresh_scores=None):
         """
         FSQM online update: manage track lifecycle.
         
@@ -563,46 +577,26 @@ class DecoderTracker(nn.Module):
                     track_instances.low_conf_count[i] = 0  # Reset counter
 
         # --- Track Initiation ---
-        # Find high-confidence detections not yet assigned
-        det_indices = torch.where(
-            (track_instances.obj_idxes.view(-1) == -1) & (track_scores > self.tau_in)
+        # Each inactive slot that THIS frame predicts confidently becomes a new track,
+        # keeping its own prediction. The slot is already inactive and already holds this
+        # frame's boxes/logits/embedding, so only the identity and score need setting --
+        # which is what the original did successfully on frame 1.
+        #
+        # `track_scores` is the post-termination copy, kept only for the non-FSQM path;
+        # initiation must use `fresh_scores`, captured before termination zeroed it.
+        scores_for_init = fresh_scores if fresh_scores is not None else track_scores
+        cand = torch.where(
+            (track_instances.obj_idxes.view(-1) == -1) & (scores_for_init > self.tau_in)
         )[0]
-
-        for det_idx in det_indices:
-            # Find first inactive slot
-            inactive_slots = torch.where(track_instances.obj_idxes.view(-1) == -1)[0]
-            if len(inactive_slots) == 0:
-                break
-            slot_idx = inactive_slots[0]
-
-            # Skip if det_idx is itself the slot (already inactive)
-            if det_idx == slot_idx:
-                track_instances.obj_idxes[slot_idx] = self.max_obj_id
-                self.max_obj_id += 1
-                track_instances.scores[slot_idx] = track_scores[det_idx]
-                track_instances.low_conf_count[slot_idx] = 0
-                continue
-
-            # Move detection to inactive slot
-            track_instances.query_pos[slot_idx] = track_instances.query_pos[det_idx].clone()
-            track_instances.ref_pts[slot_idx] = track_instances.ref_pts[det_idx].clone()
-            track_instances.output_embedding[slot_idx] = track_instances.output_embedding[det_idx].clone()
-            track_instances.pred_boxes[slot_idx] = track_instances.pred_boxes[det_idx].clone()
-            track_instances.pred_logits[slot_idx] = track_instances.pred_logits[det_idx].clone()
-            track_instances.scores[slot_idx] = track_scores[det_idx]
-            track_instances.obj_idxes[slot_idx] = self.max_obj_id
+        if cand.numel():
+            cand = cand[scores_for_init[cand].argsort(descending=True)]
+        for det_idx in cand:
+            if int(track_instances.obj_idxes.view(-1)[det_idx]) != -1:
+                continue  # given an identity earlier in this loop
+            track_instances.obj_idxes[det_idx] = self.max_obj_id
             self.max_obj_id += 1
-            track_instances.low_conf_count[slot_idx] = 0
-
-            # Clear source slot
-            d = track_instances.query_pos.shape[1]
-            track_instances.query_pos[det_idx] = torch.zeros(d, device=track_instances.query_pos.device)
-            track_instances.ref_pts[det_idx] = torch.zeros(4, device=track_instances.ref_pts.device)
-            track_instances.output_embedding[det_idx] = torch.zeros(
-                track_instances.output_embedding.shape[1], device=track_instances.output_embedding.device)
-            track_instances.obj_idxes[det_idx] = -1
-            track_instances.pred_boxes[det_idx] = torch.zeros(4, device=track_instances.pred_boxes.device)
-            track_instances.scores[det_idx] = 0.0
+            track_instances.scores[det_idx] = scores_for_init[det_idx]
+            track_instances.low_conf_count[det_idx] = 0
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""

@@ -162,7 +162,20 @@ def build_track_dataloader(dataset, batch, workers, shuffle=False, rank=-1, grou
 
     indices = list(range(len(dataset)))
     # Get video names from labels
-    video_names = [os.path.basename(label['im_file']).split('_')[0] for label in dataset.labels]
+    # Group by SEQUENCE DIRECTORY, not by filename.
+    #
+    # The previous key was `os.path.basename(im_file).split('_')[0]`. On MOT17 the
+    # basename is '000001.jpg' with no underscore, so the key was the FRAME NAME: with
+    # 5 sequences the grouping put the 5 frames named 000001.jpg -- one from each
+    # sequence -- into a single 'clip'. The tracker was thus trained to associate
+    # objects across unrelated videos and never saw two consecutive frames.
+    #
+    # The path is .../images/<split>/<SEQ>/img1/<frame>.jpg.
+    def _sequence_of(path):
+        parts = str(path).replace('\\', '/').split('/')
+        return parts[-3] if len(parts) >= 3 else ''
+
+    video_names = [_sequence_of(label['im_file']) for label in dataset.labels]
 
     # Create a dictionary to map video names to their corresponding indices in the dataset
     video_indices = {name: [] for name in set(video_names)}

@@ -552,6 +552,12 @@ class MOTRLoss(nn.Module):
         #                                  masks=masks[self.uni_match_ind] if masks is not None else None,
         #                                  gt_mask=gt_mask)
         for i, (aux_bboxes, aux_scores) in enumerate(zip(pred_bboxes, pred_scores)):
+            # A layer with no queries contributes nothing, but the matcher reshapes its
+            # cost matrix with `C.view(bs, nq, -1)` and nq == 0 makes that ambiguous, so
+            # it raises instead. Reached in stage 3 whenever every query matched and
+            # `unmatched_pred_bboxes` is therefore empty.
+            if aux_scores.shape[-2] == 0:
+                continue
             aux_masks = masks[i] if masks is not None else None
             match_indices = self.matcher(aux_bboxes,
                                          aux_scores,
@@ -624,6 +630,15 @@ class MOTRLoss(nn.Module):
         # print(match_indices)
 
         idx, gt_idx = self._get_index(match_indices)
+        # MOTR marks "no GT assignment for this slot this frame" with -1, and -1 is a
+        # legal index, so such slots were regressed onto the LAST ground-truth box of
+        # the frame and trained as positives of its class. Measured: 44.58% of all
+        # gt_idx entries on a real run were -1, so this is the dominant path.
+        # Dropping them leaves those slots at the background class, which is what
+        # "this track has no GT this frame" is supposed to mean.
+        _keep = gt_idx >= 0
+        idx = (idx[0][_keep], idx[1][_keep])
+        gt_idx = gt_idx[_keep]
         try:
             pred_bboxes, gt_bboxes = pred_bboxes[idx], gt_bboxes[gt_idx]
         except:
