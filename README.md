@@ -6,6 +6,9 @@ Official implementation of **"DecoderTracker: Decoder-Only Method for Multiple-O
 
 📌 **arXiv**: [DecoderTracker: Decoder-Only Method for Multiple-Object Tracking](https://arxiv.org/abs/2310.17170)
 
+> [!IMPORTANT]
+> **This project's core ideas have been integrated into [**di-e2e-mot**](https://github.com/D-Robotics/di-e2e-mot)** — which, to the best of our knowledge, is the **first repository that unifies end-to-end multi-object tracking model training, inference, and quantization in one place**. We gratefully acknowledge **D-Robotics (地瓜机器人)** for their compute resource support. Active development now happens over there — **please head to [di-e2e-mot](https://github.com/D-Robotics/di-e2e-mot) for the latest work**.
+
 ---
 
 ## 📖 Introduction
